@@ -1,4 +1,4 @@
-import ObsidianGit from "src/main";
+import type ObsidianGit from "src/main";
 
 export class BranchStatusBar {
     constructor(
@@ -6,8 +6,10 @@ export class BranchStatusBar {
         private readonly plugin: ObsidianGit
     ) {
         this.statusBarEl.addClass("mod-clickable");
-        this.statusBarEl.onClickEvent((e) => {
-            this.plugin.switchBranch();
+        this.statusBarEl.onClickEvent((_) => {
+            this.plugin.promiseQueue.addTask(() =>
+                this.plugin.gitActions.switchBranch()
+            );
         });
     }
 
@@ -22,5 +24,9 @@ export class BranchStatusBar {
         } else {
             this.statusBarEl.empty();
         }
+    }
+
+    remove() {
+        this.statusBarEl.remove();
     }
 }

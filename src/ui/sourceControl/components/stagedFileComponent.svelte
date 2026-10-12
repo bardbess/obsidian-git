@@ -1,104 +1,126 @@
 <script lang="ts">
     import { setIcon, TFile } from "obsidian";
-    import { hoverPreview } from "obsidian-community-lib";
-    import { DIFF_VIEW_CONFIG } from "src/constants";
-    import { GitManager } from "src/gitManager/gitManager";
-    import { FileStatusResult } from "src/types";
-    import { getDisplayPath, getNewLeaf } from "src/utils";
-    import GitView from "../sourceControl";
+    import { hoverPreview } from "src/utils";
+    import type { FileStatusResult } from "src/types";
+    import {
+        fileIsBinary,
+        fileOpenableInObsidian,
+        getDisplayPath,
+        getNewLeaf,
+        getTooltipSide,
+        mayTriggerFileMenu,
+    } from "src/utils";
+    import type GitView from "../sourceControl";
 
-    export let change: FileStatusResult;
-    export let view: GitView;
-    export let manager: GitManager;
-    let buttons: HTMLElement[] = [];
-    $: side = (view.leaf.getRoot() as any).side == "left" ? "right" : "left";
+    interface Props {
+        change: FileStatusResult;
+        view: GitView;
+    }
 
-    window.setTimeout(
-        () => buttons.forEach((b) => setIcon(b, b.getAttr("data-icon")!, 16)),
-        0
-    );
+    let { change, view }: Props = $props();
+    let buttons: HTMLElement[] = $state([]);
+    let side = $derived(getTooltipSide(view.leaf));
+
+    $effect(() => {
+        for (const b of buttons) if (b) setIcon(b, b.getAttr("data-icon")!);
+    });
+
+    function mainClick(event: MouseEvent) {
+        event.stopPropagation();
+        if (fileIsBinary(change.path)) {
+            open(event);
+        } else {
+            showDiff(event);
+        }
+    }
 
     function hover(event: MouseEvent) {
         //Don't show previews of config- or hidden files.
-        if (app.vault.getAbstractFileByPath(change.vault_path)) {
-            hoverPreview(event, view as any, change.vault_path);
+        if (view.app.vault.getFileByPath(change.vaultPath)) {
+            hoverPreview(view.app, event, view, change.vaultPath);
         }
     }
 
     function open(event: MouseEvent) {
-        const file = view.app.vault.getAbstractFileByPath(change.vault_path);
+        event.stopPropagation();
+        const file = view.app.vault.getAbstractFileByPath(change.vaultPath);
         if (file instanceof TFile) {
-            getNewLeaf(event)?.openFile(file);
+            getNewLeaf(view.app, event)
+                ?.openFile(file)
+                .catch((e) => view.plugin.displayError(e));
         }
     }
 
     function showDiff(event: MouseEvent) {
-        getNewLeaf(event)?.setViewState({
-            type: DIFF_VIEW_CONFIG.type,
-            active: true,
-            state: {
-                file: change.path,
-                staged: true,
-            },
+        event.stopPropagation();
+        view.plugin.tools.openDiff({
+            aFile: change.from ?? change.path,
+            bFile: change.path,
+            aRef: "HEAD",
+            bRef: "",
+            event,
         });
     }
 
-    function unstage() {
-        manager.unstage(change.path, false).finally(() => {
-            dispatchEvent(new CustomEvent("git-refresh"));
-        });
+    function unstage(event: MouseEvent) {
+        event.stopPropagation();
+
+        view.plugin.promiseQueue.addTask(() =>
+            view.plugin.gitActions.unstage(change.path, false)
+        );
     }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_mouse_events_have_key_events -->
 <main
-    on:mouseover={hover}
-    on:focus
-    on:click|stopPropagation={showDiff}
-    on:auxclick|stopPropagation={showDiff}
+    onmouseover={hover}
+    onclick={mainClick}
+    onauxclick={(event) => {
+        event.stopPropagation();
+        if (event.button == 2)
+            mayTriggerFileMenu(
+                view.app,
+                event,
+                change.vaultPath,
+                view.leaf,
+                "git-source-control"
+            );
+        else mainClick(event);
+    }}
     class="tree-item nav-file"
 >
     <div
         class="tree-item-self is-clickable nav-file-title"
-        class:is-active={view.plugin.lastDiffViewState?.file ==
-            change.vault_path &&
-            !view.plugin.lastDiffViewState?.hash &&
-            view.plugin.lastDiffViewState?.staged}
-        data-path={change.vault_path}
-        aria-label-position={side}
+        data-path={change.vaultPath}
         data-tooltip-position={side}
-        aria-label={change.vault_path}
+        aria-label={change.vaultPath}
     >
         <div class="tree-item-inner nav-file-title-content">
-            {getDisplayPath(change.vault_path)}
+            {getDisplayPath(change.vaultPath)}
         </div>
         <div class="git-tools">
             <div class="buttons">
-                {#if view.app.vault.getAbstractFileByPath(change.vault_path)}
+                {#if fileOpenableInObsidian(change.vaultPath, view.app)}
                     <div
                         data-icon="go-to-file"
                         aria-label="Open File"
-                        bind:this={buttons[1]}
-                        on:click|stopPropagation={open}
+                        bind:this={buttons[0]}
+                        onclick={open}
                         class="clickable-icon"
-                    />
+                    ></div>
                 {/if}
                 <div
                     data-icon="minus"
                     aria-label="Unstage"
-                    bind:this={buttons[0]}
-                    on:click|stopPropagation={unstage}
+                    bind:this={buttons[1]}
+                    onclick={unstage}
                     class="clickable-icon"
-                />
+                ></div>
             </div>
             <div class="type" data-type={change.index}>{change.index}</div>
         </div>
     </div>
 </main>
-
-<style lang="scss">
-    main {
-        .nav-file-title {
-            align-items: center;
-        }
-    }
-</style>

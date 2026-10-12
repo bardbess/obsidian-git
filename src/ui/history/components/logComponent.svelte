@@ -1,31 +1,56 @@
 <script lang="ts">
-    import ObsidianGit from "src/main";
-    import { LogEntry } from "src/types";
+    import { moment } from "obsidian";
+    import type ObsidianGit from "src/main";
+    import type { LogEntry } from "src/types";
+    import { getTooltipSide } from "src/utils";
     import { slide } from "svelte/transition";
-    import HistoryView from "../historyView";
+    import type HistoryView from "../historyView";
     import LogFileComponent from "./logFileComponent.svelte";
     import LogTreeComponent from "./logTreeComponent.svelte";
 
-    export let log: LogEntry;
-    export let view: HistoryView;
-    export let showTree: boolean;
-    export let plugin: ObsidianGit;
-    $: logsHierarchy = {
+    interface Props {
+        log: LogEntry;
+        view: HistoryView;
+        showTree: boolean;
+        plugin: ObsidianGit;
+    }
+
+    let { log, view, showTree, plugin }: Props = $props();
+    let logsHierarchy = $derived({
         title: "",
         path: "",
         vaultPath: "",
         children: plugin.gitManager.getTreeStructure(log.diff.files),
-    };
+    });
 
-    $: side = (view.leaf.getRoot() as any).side == "left" ? "right" : "left";
-    let isCollapsed = true;
+    let side = $derived(getTooltipSide(view.leaf));
+    let isCollapsed = $state(true);
+    let closed = $state<Record<string, boolean>>({});
+
+    function authorToString(log: LogEntry) {
+        const name = log.author.name;
+        if (plugin.settings.authorInHistoryView == "full") {
+            return name;
+        } else if (plugin.settings.authorInHistoryView == "initials") {
+            const words = name.split(" ").filter((word) => word.length > 0);
+
+            return words.map((word) => word[0]!.toUpperCase()).join("");
+        }
+        return "";
+    }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <main>
     <div class="tree-item nav-folder" class:is-collapsed={isCollapsed}>
         <div
             class="tree-item-self is-clickable nav-folder-title"
-            on:click={() => (isCollapsed = !isCollapsed)}
+            aria-label={`${log.refs.length > 0 ? log.refs.join(", ") + "\n" : ""}${log.author?.name}
+${moment(log.date).format(plugin.settings.commitDateFormat)}
+${log.message}`}
+            data-tooltip-position={side}
+            onclick={() => (isCollapsed = !isCollapsed)}
         >
             <div
                 class="tree-item-icon nav-folder-collapse-indicator collapse-icon"
@@ -51,12 +76,20 @@
                         {log.refs.join(", ")}
                     </div>
                 {/if}
-                <div
-                    class="tree-item-inner nav-folder-title-content"
-                    aria-label={log.message}
-                    aria-label-position={side}
-                    data-tooltip-position={side}
-                >
+                {#if plugin.settings.authorInHistoryView != "hide" && log.author?.name}
+                    <div class="git-author">
+                        {authorToString(log)}
+                    </div>
+                {/if}
+                {#if plugin.settings.dateInHistoryView}
+                    <div class="git-date">
+                        {moment(log.date).format(
+                            plugin.settings.commitDateFormat
+                        )}
+                    </div>
+                {/if}
+
+                <div class="tree-item-inner nav-folder-title-content">
                     {log.message}
                 </div>
             </div>
@@ -72,6 +105,7 @@
                         {plugin}
                         {view}
                         topLevel={true}
+                        bind:closed
                     />
                 {:else}
                     {#each log.diff.files as file}
@@ -84,7 +118,4 @@
 </main>
 
 <style lang="scss">
-    .git-ref {
-        color: var(--text-accent);
-    }
 </style>

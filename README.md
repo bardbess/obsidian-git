@@ -1,108 +1,141 @@
-# Git
+# Obsidian Git Plugin
 
-Plugin that allows you to back up your [Obsidian.md](https://obsidian.md) vault to a remote Git repository (e.g. private repo on GitHub).
+A powerful community plugin for [Obsidian.md](https://obsidian.md) that brings Git integration right into your vault. Automatically commit, pull, push, and see your changes — all within Obsidian.
 
-Requirements, installation steps (including setup for mobile), tips and tricks, common issues and more can be found in the [documentation](https://publish.obsidian.md/git-doc).
+## 📚 Documentation
 
-For mobile users see [Mobile](#mobile) section below.
+All setup instructions (including mobile), common issues, tips, and advanced configuration can be found in the 📖 [full documentation](https://publish.obsidian.md/git-doc).
 
-## Highlighted Features
+For a pull or sync stopped by conflicting changes, see [Conflict resolution](https://publish.obsidian.md/git-doc/Conflict+resolution).
 
--   Automatic vault backup every X minutes
--   Pull changes from remote repository on Obsidian startup
--   Assign hotkeys for pulling/pushing changes to a remote repository
--   Manage different repositories via Git submodules (after enabling this feature in settings)
--   The Source Control View allows you to stage and commit individual files. It can be opened with the `Open Source Control View` command.
--   The History View shows the commits and their changed files. So basically an integrated `git log`. It can be opened with the `Open History View` command.
--   For viewing the history of a file, I strongly recommend you the [Version History Diff](obsidian://show-plugin?id=obsidian-version-history-diff) plugin
+> Mobile users: The plugin is **highly unstable ⚠️ !** Please check the dedicated [Mobile](#-mobile-support-%EF%B8%8F--experimental) section below.
 
-### Source Control View
+## Key Features
 
-![Source Control View](https://raw.githubusercontent.com/denolehov/obsidian-git/master/images/source-view.png)
+- 🔁 **Automatic commit-and-sync** (commit, pull, and push) on a schedule.
+- 📥 **Auto-pull on Obsidian startup**
+- 📂 **Submodule support** for managing multiple repositories (desktop only and opt-in)
+- 🔧 **Source Control View** to stage/unstage, commit and diff files - Open it with the `Open source control view` command.
+- 📜 **History View** for browsing commit logs and changed files - Open it with the `Open history view` command.
+- 🔍 **Diff View** for viewing changes in a file - Open it with the `Open diff view` command.
+- 📝 **Signs in the editor** to indicate added, modified, and deleted lines/hunks (desktop only).
+- GitHub integration to open files and history in your browser
 
-### History View
+> For detailed file history, consider pairing this plugin with the [Version History Diff](obsidian://show-plugin?id=obsidian-version-history-diff) plugin.
 
-![History View](https://raw.githubusercontent.com/denolehov/obsidian-git/master/images/history-view.png)
+## UI Previews
+
+### 🔧 Source Control View
+
+Manage your file changes directly inside Obsidian, including staging and unstaging individual files and committing them. The main Commit action commits staged changes when present. If nothing is staged, the `Stage all changes when nothing is staged` setting determines whether all changes are staged and committed. The actions menu provides explicit staged-only and all-changes alternatives, plus amending the previous commit on desktop.
+
+![Source Control View](https://raw.githubusercontent.com/Vinzent03/obsidian-git/master/images/source-view.png)
+
+### 📜 History View
+
+Show the commit history of your repository. The commit message, author, date, and changed files can be shown. Author and date are disabled by default as shown in the screenshot, but can be enabled in the settings.
+
+![History View](https://raw.githubusercontent.com/Vinzent03/obsidian-git/master/images/history-view.png)
+
+### 🔍 Diff View 
+
+Compare versions with a clear and concise diff viewer.
+Open it from the source control view or via the `Open diff view` command.
+
+![Diff View](https://raw.githubusercontent.com/Vinzent03/obsidian-git/master/images/diff-view.png)
+
+### 📝 Signs in the Editor
+
+View line-by-line changes directly in the editor with added, modified, and deleted line/hunk indicators. You can stage and reset changes right from the signs. There also commands to navigate between hunks and stage/reset hunks under the cursor. Needs to be enabled in the plugin settings.
+
+![Signs](https://raw.githubusercontent.com/Vinzent03/obsidian-git/master/images/signs.png)
 
 ## Available Commands
+> Not exhaustive - these are just some of the most common commands. For a full list, see the Command Palette in Obsidian.
 
--   Changes
-    -   `List changed files`: Lists all changes in a modal
-    -   `Open diff view`: Open diff view for the current file
-    -   `Stage current file`
-    -   `Unstage current file`
--   Commit
-    -   `Commit all changes`: Only commits all changes without pushing
-    -   `Commit all changes with specific message`: Same as above, but with a custom message
-    -   `Commit staged`: Commits only files that have been staged
-    -   `Commit staged with specific message`: Same as above, but with a custom message
--   Backup
-    -   `Create Backup`: Commits all changes. If "Push on backup" setting is enabled, will also push the commit.
-    -   `Create Backup with specific message`: Same as above, but with a custom message
-    -   `Create backup and close`: Same as `Create Backup`, but if running on desktop, will close the Obsidian window. Will not exit Obsidian app on mobile.
--   Remote
-    -   `Push`
-    -   `Pull`
-    -   `Edit remotes`
-    -   `Remove remote`
-    -   `Clone an existing remote repo`: Opens dialog that will prompt for URL and authentication to clone a remote repo
-    -   `Open file on GitHub`: Open the file view of the current file on GitHub in a browser window. Note: only works on desktop
-    -   `Open file history on GitHub`: Open the file history of the current file on GitHub in a browser window. Note: only works on desktop
--   Local
-    -   `Initialize a new repo`
-    -   `Create new branch`
-    -   `Delete branch`
-    -   `CAUTION: Delete repository`
--   Source Control View
-    -   `Open source control view`: Opens side pane displaying [Source control view](#sidebar-view)
-    -   `Edit .gitignore`
-    -   `Add file to .gitignore`: Add current file to .gitignore
+- 🔄 Changes
+  - `List changed files`: Lists all changes in a modal
+  - `Open diff view`: Open diff view for the current file
+  - `Stage current file`
+  - `Unstage current file`
+  - `Discard all changes`: Discard all changes in the repository
+- ✅ Commit
+  - `Commit`: Commits staged changes when present. If nothing is staged, either stages and commits all changes or stops, depending on the `Stage all changes when nothing is staged` setting
+  - `Commit with specific message`: Same as above, but with a custom message
+  - `Commit all changes`: Commits all changes without pushing
+  - `Commit all changes with specific message`: Same as above, but with a custom message
+- 🔀 Commit-and-sync
+  - `Commit-and-sync`: With default settings, this will commit all changes, pull, and push
+  - `Commit-and-sync with specific message`: Same as above, but with a custom message
+  - `Commit-and-sync and close`: Same as `Commit-and-sync`, but if running on desktop, will close the Obsidian window. Will not exit Obsidian app on mobile.
+- 🌐 Remote
+  - `Push`, `Pull`
+  - `Edit remotes`: Add new remotes or edit existing remotes
+  - `Remove remote`
+  - `Clone an existing remote repo`: Opens dialog that will prompt for URL and authentication to clone a remote repo
+  - `Open file on GitHub`: Open the file view of the current file on GitHub in a browser window. Note: only works on desktop
+  - `Open file history on GitHub`: Open the file history of the current file on GitHub in a browser window. Note: only works on desktop
+- 🏠 Manage local repository
+  - `Initialize a new repo`
+  - `Create new branch`
+  - `Delete branch`
+  - `CAUTION: Delete repository`
+- 🧪 Miscellaneous
+  - `Open source control view`: Opens side pane displaying [Source control view](#sidebar-view)
+  - `Open history view`: Opens side pane displaying [History view](#history-view)
+  - `Edit .gitignore`
+  - `Add file to .gitignore`: Add current file to `.gitignore`
 
-## Desktop
+## 💻 Desktop Notes
 
-## Authentication
+### 🔐 Authentication
 
-Authentication may require additional setup. See more in the [Authentication documentation](https://publish.obsidian.md/git-doc/Authentication)
+Some Git services may require further setup for HTTPS/SSH authentication. Refer to the [Authentication Guide](https://publish.obsidian.md/git-doc/Authentication)
 
 ### Obsidian on Linux
 
--   ⚠ Snap is not supported.
--   ⚠ Flatpak is not recommended, because it doesn't have access to all system files.
+- ⚠️  Snap is not supported due to its sandboxing restrictions.
+- ⚠️  Flatpak is not recommended, because it doesn't have access to all system files. They are actively fixing many issues, but there are still issues. Especially with more advanced setups.
+- ✅ Please use AppImage or a full access installation of your system's package manager instead ([Linux installation guide](https://publish.obsidian.md/git-doc/Installation#Linux))
 
-Please use AppImage instead ([Linux installation guide](https://publish.obsidian.md/git-doc/Installation#Linux))
+## 📱 Mobile Support (⚠️  Experimental)
 
-## Mobile
+The Git implementation on mobile is **very unstable**! I would not recommend using this plugin on mobile, but try other syncing services.
 
-Installation and Getting Started can be found in the [documentation](https://publish.obsidian.md/git-doc/Getting+Started#Mobile).
+One such alternative is [GitSync](https://github.com/ViscousPot/GitSync), which is available on both Android and iOS. It is not associated with this plugin, but it may be a better option for mobile users. A tutorial for setting it up can be found [here](https://viscouspotenti.al/posts/gitsync-all-devices-tutorial).
 
-### Restrictions of the mobile version
+> 🧪 The Git plugin works on mobile thanks to [isomorphic-git](https://isomorphic-git.org/), a JavaScript-based re-implementation of Git - but it comes with serious limitations and issues. It is not possible for an Obsidian plugin to use a native Git installation on Android or iOS.
 
-I am using [isomorphic-git](https://isomorphic-git.org/), which is a re-implementation of Git in JavaScript, because you cannot use native Git on Android or iOS.
+### ❌ Mobile Feature Limitations
 
--   SSH authentication is not supported ([isomorphic-git issue](https://github.com/isomorphic-git/isomorphic-git/issues/231))
--   Repo size is limited, because of memory restrictions
--   Rebase merge strategy is not supported
--   Submodules are not supported
+- No **SSH authentication** ([isomorphic-git issue](https://github.com/isomorphic-git/isomorphic-git/issues/231))
+- Limited repo size, because of memory restrictions
+- No rebase merge strategy
+- No submodules support
 
-### Performance on mobile
+### ⚠️ Performance Caveats
 
-> **Warning**
-> Depending on your device and available free RAM, Obsidian may crash on clone/pull. I don't know how to fix this. If that's the case for you, I have to admit this plugin won't work for you. So commenting on any issue or creating a new one won't help. I am sorry.
+> [!caution]
+> Depending on your device and available free RAM, Obsidian may
+>
+> - crash on clone/pull
+> - create buffer overflow errors
+> - run indefinitely.
+>
+> It's caused by the underlying git implementation on mobile, which is not efficient. I don't know how to fix this. If that's the case for you, I have to admit this plugin won't work for you. So commenting on any issue or creating a new one won't help. I am sorry.
 
-**Setup:** iPad Pro M1 with a [repo](https://github.com/Vinzent03/obsidian-git-stress-test) of 3000 files reduced from [10000 markdown files](https://github.com/Zettelkasten-Method/10000-markdown-files)
+### Tips for Mobile Use:
 
-The initial clone took 0m25s. After that, the most time consuming part is to check the whole working directory for file changes. On this setup, checking all files for changes to stage takes 03m40s. Other commands like pull, push and commit are very fast (1-5 seconds).
+If you have a large repo/vault I recommend to stage individual files and only commit staged files.
 
-The fastest way to work on mobile if you have a large repo/vault is to stage individual files and only commit staged files.
+## 🙋 Contact & Credits
 
-## Contact
+- The Line Authoring feature was developed by [GollyTicker](https://github.com/GollyTicker), so any questions may be best answered by her.
+- This plugin was initial developed by [denolehov](https://github.com/denolehov). Since March 2021, it's me [Vinzent03](https://github.com/Vinzent03) who is developing this plugin. That's why the GitHub repository got moved to my account in July 2024.
+- If you have any kind of feedback or questions, feel free to reach out via GitHub issues.
 
-The Line Authoring feature was developed by [GollyTicker](https://github.com/GollyTicker), so any questions may be best answered by him.
+## ☕ Support
 
-If you have any kind of feedback or questions, feel free to reach out via GitHub issues or `@Vinadon` on [Obsidian Discord server](https://discord.com/invite/veuWUTm).
-
-This plugin was initial developed by [denolehov](https://github.com/denolehov). Since March 2021, it is [Vinzent03](https://github.com/Vinzent03) who is developing on this plugin.
-
-If you want to support me ([Vinzent03](https://github.com/Vinzent03)) you can support me on Ko-fi
+If you find this plugin useful and would like to support its development, you can support me on Ko-fi.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F195IQ5)

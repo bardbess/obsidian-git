@@ -1,22 +1,39 @@
 <!-- tslint:disable ts(2345)  -->
 <script lang="ts">
-    import ObsidianGit from "src/main";
-    import { HistoryRootTreeItem, TreeItem } from "src/types";
+    import LogTreeComponent from "./logTreeComponent.svelte";
+    import type ObsidianGit from "src/main";
+    import type { HistoryRootTreeItem, TreeItem } from "src/types";
+    import { getTooltipSide } from "src/utils";
     import { slide } from "svelte/transition";
-    import HistoryView from "../historyView";
+    import type HistoryView from "../historyView";
     import LogFileComponent from "./logFileComponent.svelte";
-    export let hierarchy: HistoryRootTreeItem;
-    export let plugin: ObsidianGit;
-    export let view: HistoryView;
-    export let topLevel = false;
-    const closed: Record<string, boolean> = {};
-    $: side = (view.leaf.getRoot() as any).side == "left" ? "right" : "left";
 
-    function fold(item: TreeItem) {
-        closed[item.title] = !closed[item.title];
+    interface Props {
+        hierarchy: HistoryRootTreeItem;
+        plugin: ObsidianGit;
+        view: HistoryView;
+        topLevel?: boolean;
+        closed: Record<string, boolean>;
+    }
+
+    let {
+        hierarchy,
+        plugin,
+        view,
+        topLevel = false,
+        closed = $bindable(),
+    }: Props = $props();
+
+    let side = $derived(getTooltipSide(view.leaf));
+
+    function fold(event: MouseEvent, item: TreeItem) {
+        event.stopPropagation();
+        closed[item.path] = !closed[item.path];
     }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <main class:topLevel>
     {#each hierarchy.children as entity}
         {#if entity.data}
@@ -26,22 +43,21 @@
         {:else}
             <div
                 class="tree-item nav-folder"
-                class:is-collapsed={closed[entity.title]}
+                class:is-collapsed={closed[entity.path]}
             >
                 <div
                     class="tree-item-self is-clickable nav-folder-title"
-                    aria-label-position={side}
                     data-tooltip-position={side}
                     aria-label={entity.vaultPath}
-                    on:click={() => fold(entity)}
+                    onclick={(event) => fold(event, entity)}
                 >
                     <div
                         data-icon="folder"
                         style="padding-right: 5px; display: flex; "
-                    />
+                    ></div>
                     <div
                         class="tree-item-icon nav-folder-collapse-indicator collapse-icon"
-                        class:is-collapsed={closed[entity.title]}
+                        class:is-collapsed={closed[entity.path]}
                     >
                         <svg
                             xmlns="http://www.w3.org/2000/svg"
@@ -62,12 +78,17 @@
                     </div>
                 </div>
 
-                {#if !closed[entity.title]}
+                {#if !closed[entity.path]}
                     <div
                         class="tree-item-children nav-folder-children"
                         transition:slide|local={{ duration: 150 }}
                     >
-                        <svelte:self hierarchy={entity} {plugin} {view} />
+                        <LogTreeComponent
+                            hierarchy={entity as HistoryRootTreeItem}
+                            {plugin}
+                            {view}
+                            bind:closed
+                        />
                     </div>
                 {/if}
             </div>

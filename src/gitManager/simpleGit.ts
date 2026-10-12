@@ -1,35 +1,51 @@
-import { spawnSync } from "child_process";
 import debug from "debug";
-import { FileSystemAdapter, normalizePath, Notice } from "obsidian";
+import * as fsPromises from "fs/promises";
+import type { FileSystemAdapter } from "obsidian";
+import { normalizePath, Notice, Platform } from "obsidian";
 import * as path from "path";
-import { sep } from "path";
-import simpleGit, * as simple from "simple-git";
-import { GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH } from "src/constants";
-import { LineAuthorFollowMovement } from "src/lineAuthor/model";
-import ObsidianGit from "../main";
+import { resolve, sep } from "path";
+import type * as simple from "simple-git";
+import { simpleGit, GitError, CleanOptions } from "simple-git";
 import {
+    ASK_PASS_INPUT_FILE,
+    ASK_PASS_SCRIPT,
+    ASK_PASS_SCRIPT_FILE,
+    DEFAULT_WIN_GIT_PATH,
+    GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH,
+} from "src/constants";
+import type { LineAuthorFollowMovement } from "src/editor/lineAuthor/model";
+import { GeneralModal } from "src/ui/modals/generalModal";
+import type ObsidianGit from "../main";
+import type {
     Blame,
     BlameCommit,
     BranchInfo,
+    DiffFile,
     FileStatusResult,
+    GitProgress,
     LogEntry,
-    PluginState,
+    PullResult,
+    PushResult,
     Status,
 } from "../types";
-import { impossibleBranch, splitRemoteBranch } from "../utils";
+import { GitConflictError, GitOperation, NoNetworkError } from "../types";
+import { impossibleBranch, spawnAsync, splitRemoteBranch } from "../utils";
 import { GitManager } from "./gitManager";
 
 export class SimpleGit extends GitManager {
-    git: simple.SimpleGit;
+    git!: simple.SimpleGit;
+    absoluteRepoPath!: string;
+    watchAbortController: AbortController | undefined;
+    useDefaultWindowsGitPath: boolean = false;
     constructor(plugin: ObsidianGit) {
         super(plugin);
     }
 
     async setGitInstance(ignoreError = false): Promise<void> {
-        if (this.isGitInstalled()) {
+        if (await this.isGitInstalled()) {
             const adapter = this.app.vault.adapter as FileSystemAdapter;
-            const path = adapter.getBasePath();
-            let basePath = path;
+            const vaultBasePath = adapter.getBasePath();
+            let basePath = vaultBasePath;
             // Because the basePath setting is a relative path, a leading `/` must
             // be appended before concatenating with the path.
             if (this.plugin.settings.basePath) {
@@ -37,78 +53,460 @@ export class SimpleGit extends GitManager {
                     normalizePath(this.plugin.settings.basePath)
                 );
                 if (exists) {
-                    basePath = path + sep + this.plugin.settings.basePath;
+                    basePath = path.join(
+                        vaultBasePath,
+                        this.plugin.settings.basePath
+                    );
                 } else if (!ignoreError) {
                     new Notice("ObsidianGit: Base path does not exist");
                 }
             }
+            this.absoluteRepoPath = basePath;
 
-            this.git = simpleGit({
-                baseDir: basePath,
-                binary: this.plugin.localStorage.getGitPath() || undefined,
-                config: ["core.quotepath=off"],
-            });
             const pathPaths = this.plugin.localStorage.getPATHPaths();
             const envVars = this.plugin.localStorage.getEnvVars();
             const gitDir = this.plugin.settings.gitDir;
+            const envs = { ...process.env };
             if (pathPaths.length > 0) {
-                const path = process.env["PATH"] + ":" + pathPaths.join(":");
-                process.env["PATH"] = path;
+                const joinedPath =
+                    pathPaths.join(path.delimiter) +
+                    path.delimiter +
+                    envs["PATH"];
+                envs["PATH"] = joinedPath;
             }
             if (gitDir) {
-                process.env["GIT_DIR"] = gitDir;
+                envs["GIT_DIR"] = gitDir;
+                envs["GIT_WORK_TREE"] = basePath;
             }
             for (const envVar of envVars) {
                 const [key, value] = envVar.split("=");
-                process.env[key] = value;
+                if (key === undefined) continue;
+                envs[key] = value;
             }
 
-            debug.enable("simple-git");
-            if (await this.git.checkIsRepo()) {
-                await this.git.cwd(await this.git.revparse("--show-toplevel"));
+            this.git = simpleGit({
+                baseDir: basePath,
+                binary:
+                    this.plugin.localStorage.getGitPath() ||
+                    (this.useDefaultWindowsGitPath
+                        ? DEFAULT_WIN_GIT_PATH
+                        : undefined),
+                config: ["core.quotepath=off"],
+                // Preserve the inherited and user-configured environment
+                allowEnvironment: [
+                    ...Object.keys(envs),
+                    "SSH_ASKPASS",
+                    "SSH_ASKPASS_REQUIRE",
+                    "OBSIDIAN_GIT_CREDENTIALS_INPUT",
+                    "OBSIDIAN_GIT",
+                ],
+                progress: (progress) => {
+                    this.plugin.statusBar?.displayProgress(
+                        this.toGitProgress(progress)
+                    );
+                },
+                unsafe: {
+                    allowAbbreviatedOptions: true,
+                    allowUnsafeCustomBinary: true,
+                    allowUnsafeEditor: true,
+                    allowUnsafeAskPass: true,
+                    allowUnsafeConfigEnvCount: true,
+                    allowUnsafeConfigPaths: true,
+                    allowUnsafeCredentialHelper: true,
+                    allowUnsafeGitProxy: true,
+                    allowUnsafeGpgProgram: true,
+                    allowUnsafeHooksPath: true,
+                    allowUnsafeMergeDriver: true,
+                    allowUnsafeSshCommand: true,
+                    allowUnsafePager: true,
+                    allowUnsafeDiffTextConv: true,
+                    allowUnsafeCommandBinaries: true,
+                    allowUnsafeExec: true,
+                    allowUnsafeInclude: true,
+                    allowUnsafeSubmodule: true,
+                    allowUnsafeUrlRewrite: true,
+                },
+            });
+
+            const SIMPLE_GIT_NAMESPACE = "simple-git";
+            const NAMESPACE_SEPARATOR = ",";
+            const currentDebug = (localStorage.debug ?? "") as string;
+            const namespaces = currentDebug.split(NAMESPACE_SEPARATOR);
+
+            if (
+                !namespaces.includes(SIMPLE_GIT_NAMESPACE) &&
+                !namespaces.includes(`-${SIMPLE_GIT_NAMESPACE}`)
+            ) {
+                namespaces.push(SIMPLE_GIT_NAMESPACE);
+                debug.enable(namespaces.join(NAMESPACE_SEPARATOR));
             }
+
+            if (await this.git.env(envs).checkIsRepo()) {
+                // Resolve the relative root reported by git into an absolute path
+                // in case git resides in a different filesystem (eg, WSL)
+                const relativeRoot = await this.git.revparse("--show-cdup");
+                const absoluteRoot = resolve(basePath + sep + relativeRoot);
+
+                this.absoluteRepoPath = absoluteRoot;
+                await this.git.cwd(absoluteRoot);
+            }
+
+            const absolutePluginConfigPath = path.join(
+                vaultBasePath,
+                this.app.vault.configDir,
+                "plugins",
+                "obsidian-git"
+            );
+            const askPassPath = path.join(
+                absolutePluginConfigPath,
+                ASK_PASS_SCRIPT_FILE
+            );
+
+            if (envs["SSH_ASKPASS"] == undefined) {
+                envs["SSH_ASKPASS"] = askPassPath;
+            }
+
+            // OpenSSH requires DISPLAY variable to be set for SSH_ASKPASS to
+            // detect a graphical environment. This is not the case for e.g.
+            // Windows. Setting SSH_ASKPASS_REQUIRE to "force" makes it use
+            // SSH_ASKPASS even without DISPLAY, which allows the askpass script
+            // to work on Windows as well.
+            envs["SSH_ASKPASS_REQUIRE"] = "force";
+            envs["OBSIDIAN_GIT_CREDENTIALS_INPUT"] = path.join(
+                absolutePluginConfigPath,
+                ASK_PASS_INPUT_FILE
+            );
+            if (envs["SSH_ASKPASS"] == askPassPath) {
+                this.askpass().catch((e) => this.plugin.displayError(e));
+            }
+
+            envs["OBSIDIAN_GIT"] = "1";
+
+            this.git = this.git.env(envs);
         }
     }
 
-    async status(): Promise<Status> {
-        this.plugin.setState(PluginState.status);
-        const status = await this.git.status((err) => this.onError(err));
-        this.plugin.setState(PluginState.idle);
+    private toGitProgress(
+        progress: simple.SimpleGitProgressEvent
+    ): GitProgress {
         return {
-            changed: status.files
-                .filter((e) => e.working_dir !== " ")
-                .map((e) => {
-                    const res = this.formatPath(e);
-
-                    return <FileStatusResult>{
-                        path: res.path,
-                        from: res.from,
-                        working_dir:
-                            e.working_dir === "?" ? "U" : e.working_dir,
-                        vault_path: this.getVaultPath(res.path),
-                    };
-                }),
-            staged: status.files
-                .filter((e) => e.index !== " " && e.index != "?")
-                .map((e) => {
-                    const res = this.formatPath(e, e.index === "R");
-                    return <FileStatusResult>{
-                        path: res.path,
-                        from: res.from,
-                        index: e.index,
-                        vault_path: this.getVaultPath(res.path),
-                    };
-                }),
-            conflicted: status.conflicted.map(
-                (path) => this.formatPath({ path }).path
-            ),
+            action: this.getProgressAction(progress.method),
+            stage: progress.stage,
+            progress: progress.progress,
+            processed: progress.processed,
+            total: progress.total,
         };
+    }
+
+    private getProgressAction(method: string): string {
+        switch (method) {
+            case "fetch":
+                return "Fetching";
+            case "push":
+                return "Pushing";
+            case "pull":
+                return "Pulling";
+            case "checkout":
+                return "Checking out";
+            default:
+                return method
+                    ? method.charAt(0).toUpperCase() + method.slice(1)
+                    : "Working";
+        }
+    }
+
+    // Constructs a path relative to the vault from a path relative to the git repository
+    getRelativeVaultPath(filePath: string): string {
+        const adapter = this.app.vault.adapter as FileSystemAdapter;
+        const from = adapter.getBasePath();
+
+        const to = path.join(this.absoluteRepoPath, filePath);
+
+        let res = path.relative(from, to);
+        if (Platform.isWin) {
+            res = res.replace(/\\/g, "/");
+        }
+        return res;
+    }
+
+    // Constructs a path relative to the git repository from a path relative to the vault
+    //
+    // @param doConversion - If false, the path is returned as is. This is added because that parameter is often passed on to functions where this method is called.
+    getRelativeRepoPath(
+        filePath: string,
+        doConversion: boolean = true
+    ): string {
+        if (doConversion) {
+            const adapter = this.plugin.app.vault.adapter as FileSystemAdapter;
+            const vaultPath = adapter.getBasePath();
+            const from = this.absoluteRepoPath;
+            const to = path.join(vaultPath, filePath);
+            let res = path.relative(from, to);
+            if (Platform.isWin) {
+                res = res.replace(/\\/g, "/");
+            }
+            return res;
+        }
+        return filePath;
+    }
+
+    protected getVaultPathspec(): string | undefined {
+        if (!this.plugin.settings.limitToVault) return undefined;
+
+        const adapter = this.app.vault.adapter as FileSystemAdapter;
+        const vaultPath = path.resolve(adapter.getBasePath());
+        const repositoryPath = path.resolve(this.absoluteRepoPath);
+        const relativePath = path.relative(repositoryPath, vaultPath);
+
+        if (
+            relativePath === "" ||
+            relativePath === ".." ||
+            relativePath.startsWith(".." + path.sep) ||
+            path.isAbsolute(relativePath)
+        ) {
+            return undefined;
+        }
+
+        return relativePath.split(path.sep).join("/");
+    }
+
+    private async countPathsOutsideVault(args: string[]): Promise<number> {
+        const output = await this.git.raw([...args, "-z"]);
+        return output
+            .split("\0")
+            .filter((filePath) => filePath && !this.isPathInsideVault(filePath))
+            .length;
+    }
+
+    private get absPluginConfigPath(): string {
+        const adapter = this.app.vault.adapter as FileSystemAdapter;
+        const vaultPath = adapter.getBasePath();
+        return path.join(
+            vaultPath,
+            this.app.vault.configDir,
+            "plugins",
+            "obsidian-git"
+        );
+    }
+
+    private get relPluginConfigPath(): string {
+        return path.join(this.app.vault.configDir, "plugins", "obsidian-git");
+    }
+    async askpass(): Promise<void> {
+        const adapter = this.app.vault.adapter as FileSystemAdapter;
+        const relPluginConfigDir =
+            this.app.vault.configDir + "/plugins/obsidian-git/";
+
+        await this.addAskPassScriptToExclude();
+
+        await fsPromises.writeFile(
+            path.join(this.absPluginConfigPath, ASK_PASS_SCRIPT_FILE),
+            ASK_PASS_SCRIPT
+        );
+        await fsPromises.chmod(
+            path.join(this.absPluginConfigPath, ASK_PASS_SCRIPT_FILE),
+            0o755
+        );
+        this.watchAbortController = new AbortController();
+        const { signal } = this.watchAbortController;
+        try {
+            const watcher = fsPromises.watch(this.absPluginConfigPath, {
+                signal,
+            });
+
+            for await (const event of watcher) {
+                if (event.filename != ASK_PASS_INPUT_FILE) continue;
+                const triggerFilePath =
+                    relPluginConfigDir + ASK_PASS_INPUT_FILE;
+
+                // Wait a bit to ensure the file is fully removed
+                await new Promise((res) => window.setTimeout(res, 200));
+                if (!(await adapter.exists(triggerFilePath))) continue;
+
+                const data = await adapter.read(triggerFilePath);
+                let notice: Notice | undefined;
+                // The text is too long for the modal, so a notice is shown instead
+                if (data.length > 60) {
+                    notice = new Notice(data, 999_999);
+                }
+                let obscure = true;
+
+                // This does only work for English output.
+                // There is no general way detect the type of input asked for.
+                // We could enfore english output, but that is not beneficial
+                // for the user either.
+                if (data.contains("Username for")) {
+                    obscure = false;
+                }
+                const response = await new GeneralModal(this.plugin, {
+                    allowEmpty: true,
+                    obscure,
+                    placeholder:
+                        data.length > 60
+                            ? "Enter a response to the message."
+                            : data,
+                }).openAndGetResult();
+                notice?.hide();
+
+                // Just in case the trigger file was removed while the modal was open
+                if (await adapter.exists(triggerFilePath)) {
+                    await adapter.write(
+                        `${triggerFilePath}.response`,
+                        response ?? ""
+                    );
+                }
+            }
+        } catch (error) {
+            this.plugin.displayError(error);
+            await fsPromises.rm(
+                path.join(this.absPluginConfigPath, ASK_PASS_SCRIPT_FILE),
+                { force: true }
+            );
+            await fsPromises.rm(
+                path.join(
+                    this.absPluginConfigPath,
+                    `${ASK_PASS_SCRIPT_FILE}.response`
+                ),
+                { force: true }
+            );
+            await new Promise((res) => window.setTimeout(res, 5000));
+            this.plugin.log("Retry watch for ask pass");
+            await this.askpass();
+        }
+    }
+
+    /**
+     * Adds the askpass script to the exclude file of the git repository.
+     *
+     * This prevents the script from being tracked by git. This should be no
+     * problem as the script does not contain any sensitive data, but may
+     * cause issues with file permissions on other devices.
+     * See https://github.com/Vinzent03/obsidian-git/issues/903
+     */
+    async addAskPassScriptToExclude(): Promise<void> {
+        try {
+            if (!(await this.git.checkIsRepo())) {
+                return;
+            }
+            const absoluteExcludeFilePath = await this.git.revparse([
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ]);
+
+            const vaultRelativeAskPassScriptFile = path.join(
+                this.app.vault.configDir,
+                "plugins",
+                "obsidian-git",
+                ASK_PASS_SCRIPT_FILE
+            );
+            const repoRelativeAskPassScriptFile = this.getRelativeRepoPath(
+                vaultRelativeAskPassScriptFile,
+                true
+            );
+
+            const content = await fsPromises.readFile(
+                absoluteExcludeFilePath,
+                "utf-8"
+            );
+            const lines = content.split("\n");
+            const contains = lines.some((line) =>
+                line.contains(repoRelativeAskPassScriptFile)
+            );
+            if (!contains) {
+                await fsPromises.appendFile(
+                    absoluteExcludeFilePath,
+                    repoRelativeAskPassScriptFile + "\n"
+                );
+            }
+        } catch (error) {
+            // Catch any errors, because this is not critical
+            console.error(
+                "Error while adding askpass script to exclude file:",
+                error
+            );
+        }
+    }
+
+    unload(): void {
+        this.watchAbortController?.abort();
+    }
+
+    async status(opts?: { path?: string }): Promise<Status> {
+        const dir = opts?.path ?? this.getVaultPathspec();
+        const [status, stagedOutsideVault, conflictedOutsideVault] =
+            await Promise.all([
+                this.git.status(dir != undefined ? ["--", dir] : []),
+                this.getVaultPathspec() == undefined
+                    ? 0
+                    : this.countPathsOutsideVault([
+                          "diff",
+                          "--cached",
+                          "--name-only",
+                          "--diff-filter=ACDMRT",
+                      ]),
+                this.getVaultPathspec() == undefined
+                    ? 0
+                    : this.countPathsOutsideVault([
+                          "diff",
+                          "--name-only",
+                          "--diff-filter=U",
+                      ]),
+            ]);
+
+        const allFilesFormatted = status.files.map<FileStatusResult>((e) => {
+            const res = this.formatPath(e);
+            return {
+                path: res.path,
+                from: res.from,
+                index: e.index === "?" ? "U" : e.index,
+                workingDir: e.working_dir === "?" ? "U" : e.working_dir,
+                vaultPath: this.getRelativeVaultPath(res.path),
+            };
+        });
+        const conflicted = status.conflicted.map(
+            (path) => this.formatPath({ path }).path
+        );
+        const conflictedPaths = new Set(conflicted);
+        return {
+            all: allFilesFormatted,
+            changed: allFilesFormatted.filter(
+                (e) => e.workingDir !== " " && !conflictedPaths.has(e.path)
+            ),
+            staged: allFilesFormatted.filter(
+                (e) => e.index !== " " && e.index != "U"
+            ),
+            conflicted,
+            stagedOutsideVault,
+            conflictedOutsideVault,
+        };
+    }
+
+    async isMergeInProgress(): Promise<boolean> {
+        const mergeHead = await this.git.revparse(["--git-path", "MERGE_HEAD"]);
+        const mergeHeadPath = path.resolve(
+            this.absoluteRepoPath,
+            mergeHead.trim()
+        );
+        try {
+            await fsPromises.access(mergeHeadPath);
+            return true;
+        } catch (error) {
+            if (
+                error instanceof Error &&
+                "code" in error &&
+                error.code === "ENOENT"
+            ) {
+                return false;
+            }
+            throw error;
+        }
     }
 
     async submoduleAwareHeadRevisonInContainingDirectory(
         filepath: string
     ): Promise<string> {
-        const repoPath = this.asRepositoryRelativePath(filepath, true);
+        const repoPath = this.getRelativeRepoPath(filepath);
 
         const containingDirectory = path.dirname(repoPath);
         const args = ["-C", containingDirectory, "rev-parse", "HEAD"];
@@ -117,29 +515,27 @@ export class SimpleGit extends GitManager {
         result.catch((err) =>
             console.warn("obsidian-git: rev-parse error:", err)
         );
-        return result;
+        return (await result).trim();
     }
 
     async getSubmodulePaths(): Promise<string[]> {
-        return new Promise<string[]>(async (resolve) => {
-            this.git.outputHandler(async (cmd, stdout, stderr, args) => {
+        return new Promise<string[]>((resolve) => {
+            this.git.outputHandler((_cmd, stdout, _stderr, args) => {
                 // Do not run this handler on other commands
                 if (!(args.contains("submodule") && args.contains("foreach"))) {
                     return;
                 }
 
                 let body = "";
-                const root =
-                    (
-                        this.app.vault.adapter as FileSystemAdapter
-                    ).getBasePath() +
-                    (this.plugin.settings.basePath
-                        ? "/" + this.plugin.settings.basePath
-                        : "");
-                stdout.on("data", (chunk) => {
+                // `submodule foreach` prints paths relative to git's cwd, which
+                // is the repo root (see setGitInstance), not the vault folder.
+                // The vault may live in a subfolder of the repo, in which case
+                // prefixing the vault path yields a non-existent directory.
+                const root = this.absoluteRepoPath;
+                stdout.on("data", (chunk: Buffer) => {
                     body += chunk.toString("utf8");
                 });
-                stdout.on("end", async () => {
+                stdout.on("end", () => {
                     const submods = body.split("\n");
 
                     // Remove words like `Entering` in front of each line and filter empty lines
@@ -147,26 +543,47 @@ export class SimpleGit extends GitManager {
                         .map((i) => {
                             const submod = i.match(/'([^']*)'/);
                             if (submod != undefined) {
-                                return root + "/" + submod[1] + sep;
+                                return root + "/" + submod[1]! + sep;
                             }
+                            return undefined;
                         })
-                        .filter((i): i is string => !!i);
+                        .filter((i): i is string => !!i)
+                        .filter((submodulePath) => {
+                            if (this.getVaultPathspec() == undefined) {
+                                return true;
+                            }
+                            const adapter = this.app.vault
+                                .adapter as FileSystemAdapter;
+                            const relativePath = path.relative(
+                                path.resolve(adapter.getBasePath()),
+                                path.resolve(submodulePath)
+                            );
+                            return !(
+                                relativePath === ".." ||
+                                relativePath.startsWith(".." + path.sep) ||
+                                path.isAbsolute(relativePath)
+                            );
+                        });
 
                     strippedSubmods.reverse();
                     resolve(strippedSubmods);
                 });
             });
 
-            await this.git.subModule(["foreach", "--recursive", ""]);
-            this.git.outputHandler(() => {});
+            this.git.subModule(["foreach", "--recursive", ""]).then(
+                () => {
+                    this.git.outputHandler(() => {});
+                },
+                (e) => this.plugin.displayError(e)
+            );
         });
     }
 
     //Remove wrong `"` like "My file.md"
-    formatPath(
-        path: { from?: string; path: string },
-        renamed = false
-    ): { path: string; from?: string } {
+    formatPath(path: { from?: string; path: string }): {
+        path: string;
+        from?: string;
+    } {
         function format(path?: string): string | undefined {
             if (path == undefined) return undefined;
 
@@ -176,7 +593,7 @@ export class SimpleGit extends GitManager {
                 return path;
             }
         }
-        if (renamed) {
+        if (path.from != undefined) {
             return {
                 from: format(path.from),
                 path: format(path.path)!,
@@ -193,7 +610,7 @@ export class SimpleGit extends GitManager {
         trackMovement: LineAuthorFollowMovement,
         ignoreWhitespace: boolean
     ): Promise<Blame | "untracked"> {
-        path = this.asRepositoryRelativePath(path, true);
+        path = this.getRelativeRepoPath(path);
 
         if (!(await this.isTracked(path))) return "untracked";
 
@@ -221,10 +638,7 @@ export class SimpleGit extends GitManager {
 
         args.push("--", relativePath);
 
-        const rawBlame = await this.git.raw(
-            args,
-            (err) => err && console.warn("git-blame", err)
-        );
+        const rawBlame = await this.git.raw(args);
         return parseBlame(rawBlame);
     }
 
@@ -234,98 +648,127 @@ export class SimpleGit extends GitManager {
         const relativePath = inSubmodule ? inSubmodule.relativeFilepath : path;
 
         args.push("ls-files", "--", relativePath);
-        return this.git
-            .raw(args, (err) => err && console.warn("ls-files", err))
-            .then((x) => x.trim() !== "");
+        return this.git.raw(args).then((x) => x.trim() !== "");
     }
 
-    async commitAll({ message }: { message: string }): Promise<number> {
-        if (this.plugin.settings.updateSubmodules) {
-            this.plugin.setState(PluginState.commit);
-            const submodulePaths = await this.getSubmodulePaths();
-            for (const item of submodulePaths) {
-                await this.git
-                    .cwd({ path: item, root: false })
-                    .add("-A", (err) => this.onError(err));
-                await this.git
-                    .cwd({ path: item, root: false })
-                    .commit(await this.formatCommitMessage(message), (err) =>
-                        this.onError(err)
-                    );
+    async commitAll({
+        message,
+        amend,
+    }: {
+        message: string;
+        amend?: boolean;
+    }): Promise<number> {
+        return this.withGitOperation(GitOperation.commit, async () => {
+            if (this.plugin.settings.updateSubmodules) {
+                const submodulePaths = await this.getSubmodulePaths();
+                for (const item of submodulePaths) {
+                    await this.git.cwd({ path: item, root: false }).add("-A");
+                    await this.git
+                        .cwd({ path: item, root: false })
+                        .commit(await this.formatCommitMessage(message));
+                }
             }
-        }
-        this.plugin.setState(PluginState.add);
+            const vaultPath = this.getVaultPathspec();
+            await this.git.add(
+                vaultPath == undefined ? "-A" : ["-A", "--", vaultPath]
+            );
 
-        await this.git.add("-A", (err) => this.onError(err));
-
-        this.plugin.setState(PluginState.commit);
-
-        const res = await this.git.commit(
-            await this.formatCommitMessage(message),
-            (err) => this.onError(err)
-        );
-        dispatchEvent(new CustomEvent("git-head-update"));
-
-        return res.summary.changes;
+            const res = await this.git.commit(
+                await this.formatCommitMessage(message),
+                amend ? ["--amend"] : []
+            );
+            this.app.workspace.trigger("obsidian-git:head-change");
+            return this.getCommittedFilesCount(res.summary.changes);
+        });
     }
 
-    async commit(message: string): Promise<number> {
-        this.plugin.setState(PluginState.commit);
+    async commit({
+        message,
+        amend,
+    }: {
+        message: string;
+        amend?: boolean;
+    }): Promise<number> {
+        return this.withGitOperation(GitOperation.commit, async () => {
+            try {
+                const res = await this.git.commit(
+                    await this.formatCommitMessage(message),
+                    amend ? ["--amend"] : []
+                );
+                this.app.workspace.trigger("obsidian-git:head-change");
+                return this.getCommittedFilesCount(res.summary.changes);
+            } catch (error) {
+                return this.throwConflictError(error);
+            }
+        });
+    }
 
-        const res = (
-            await this.git.commit(
-                await this.formatCommitMessage(message),
-                (err) => this.onError(err)
-            )
-        ).summary.changes;
-        dispatchEvent(new CustomEvent("git-head-update"));
+    private async getCommittedFilesCount(
+        summaryChanges: number
+    ): Promise<number> {
+        if (summaryChanges !== 0) return summaryChanges;
+        // In case of a merge commit, the summary emitted by the commit command is empty.
 
-        this.plugin.setState(PluginState.idle);
-        return res;
+        return (await this.git.diffSummary(["HEAD^1", "HEAD"])).changed;
     }
 
     async stage(path: string, relativeToVault: boolean): Promise<void> {
-        this.plugin.setState(PluginState.add);
-
-        path = this.asRepositoryRelativePath(path, relativeToVault);
-        await this.git.add(["--", path], (err) => this.onError(err));
-
-        this.plugin.setState(PluginState.idle);
+        path = this.getRelativeRepoPath(path, relativeToVault);
+        await this.git.add(["--", path]);
     }
 
     async stageAll({ dir }: { dir?: string }): Promise<void> {
-        this.plugin.setState(PluginState.add);
-        await this.git.add(dir ?? "-A", (err) => this.onError(err));
-        this.plugin.setState(PluginState.idle);
+        const scopedDir = dir ?? this.getVaultPathspec();
+        await this.git.add(
+            scopedDir == undefined ? "-A" : ["-A", "--", scopedDir]
+        );
     }
 
     async unstageAll({ dir }: { dir?: string }): Promise<void> {
-        this.plugin.setState(PluginState.add);
-        await this.git.reset(dir != undefined ? ["--", dir] : [], (err) =>
-            this.onError(err)
-        );
-        this.plugin.setState(PluginState.idle);
+        const scopedDir = dir ?? this.getVaultPathspec();
+        await this.git.reset(scopedDir != undefined ? ["--", scopedDir] : []);
     }
 
     async unstage(path: string, relativeToVault: boolean): Promise<void> {
-        this.plugin.setState(PluginState.add);
-
-        path = this.asRepositoryRelativePath(path, relativeToVault);
-        await this.git.reset(["--", path], (err) => this.onError(err));
-
-        this.plugin.setState(PluginState.idle);
+        path = this.getRelativeRepoPath(path, relativeToVault);
+        await this.git.reset(["--", path]);
     }
 
     async discard(filepath: string): Promise<void> {
-        this.plugin.setState(PluginState.add);
-        await this.git.checkout(["--", filepath], (err) => this.onError(err));
-        this.plugin.setState(PluginState.idle);
+        if (await this.isTracked(filepath)) {
+            await this.git.checkout(["--progress", "--", filepath]);
+        }
+    }
+
+    async applyPatch(patch: string): Promise<void> {
+        const patchPath = path.join(this.relPluginConfigPath, "patch");
+        await this.app.vault.adapter.write(patchPath, patch);
+        await this.git.applyPatch(patchPath, {
+            "--cached": null,
+            "--unidiff-zero": null,
+            "--whitespace": "nowarn",
+        });
+        await this.app.vault.adapter.remove(patchPath);
+    }
+
+    async getUntrackedPaths(opts: { path?: string }): Promise<string[]> {
+        const dir = opts?.path ?? this.getVaultPathspec();
+        const args = [];
+        if (dir != undefined) {
+            args.push("--", dir);
+        }
+        const untrackedFiles = await this.git.clean(
+            CleanOptions.RECURSIVE + CleanOptions.DRY_RUN,
+            args
+        );
+
+        return untrackedFiles.paths;
     }
 
     async hashObject(filepath: string): Promise<string> {
         // Need to use raw command here to ensure filenames are literally used.
         // Perhaps we could file a PR? https://github.com/steveukx/git-js/blob/main/simple-git/src/lib/tasks/hash-object.ts
-        filepath = this.asRepositoryRelativePath(filepath, true);
+        filepath = this.getRelativeRepoPath(filepath);
         const inSubmodule = await this.getSubmoduleOfFile(filepath);
         const args = inSubmodule ? ["-C", inSubmodule.submodule] : [];
         const relativeFilepath = inSubmodule
@@ -335,147 +778,326 @@ export class SimpleGit extends GitManager {
         args.push("hash-object", "--", relativeFilepath);
 
         const revision = this.git.raw(args);
-        revision.catch(
-            (err) =>
-                err &&
-                console.warn("obsidian-git. hash-object failed:", err?.message)
-        );
         return revision;
     }
 
     async discardAll({ dir }: { dir?: string }): Promise<void> {
-        return this.discard(dir ?? ".");
+        return this.discard(dir ?? this.getVaultPathspec() ?? ".");
     }
 
-    async pull(): Promise<FileStatusResult[] | undefined> {
-        this.plugin.setState(PluginState.pull);
-        if (this.plugin.settings.updateSubmodules)
-            await this.git.subModule(
-                ["update", "--remote", "--merge", "--recursive"],
-                (err) => this.onError(err)
-            );
-
-        const branchInfo = await this.branchInfo();
-        const localCommit = await this.git.revparse(
-            [branchInfo.current!],
-            (err) => this.onError(err)
-        );
-
-        await this.git.fetch((err) => this.onError(err));
-        const upstreamCommit = await this.git.revparse(
-            [branchInfo.tracking!],
-            (err) => this.onError(err)
-        );
-
-        if (localCommit !== upstreamCommit) {
-            if (
-                this.plugin.settings.syncMethod === "merge" ||
-                this.plugin.settings.syncMethod === "rebase"
-            ) {
-                try {
-                    switch (this.plugin.settings.syncMethod) {
-                        case "merge":
-                            await this.git.merge([branchInfo.tracking!]);
-                            break;
-                        case "rebase":
-                            await this.git.rebase([branchInfo.tracking!]);
+    async pull(): Promise<PullResult> {
+        return this.withGitOperation(GitOperation.pull, async () => {
+            try {
+                if (this.plugin.settings.updateSubmodules) {
+                    const args = [
+                        "update",
+                        "--remote",
+                        "--merge",
+                        "--recursive",
+                    ];
+                    const vaultPath = this.getVaultPathspec();
+                    if (vaultPath != undefined) {
+                        args.push("--", vaultPath);
                     }
-                } catch (err) {
-                    this.plugin.displayError(
-                        `Pull failed (${this.plugin.settings.syncMethod}): ${err.message}`
-                    );
-                    return;
+                    await this.git.subModule(args);
                 }
-            } else if (this.plugin.settings.syncMethod === "reset") {
-                try {
-                    await this.git.raw(
-                        [
+
+                const branchInfo = await this.branchInfo();
+                if (!branchInfo.current) {
+                    throw new Error("No current branch found. Cannot pull.");
+                }
+                const localCommit = await this.git.revparse([
+                    branchInfo.current,
+                ]);
+
+                if (!branchInfo.tracking) {
+                    this.plugin.log(
+                        this.plugin.settings.updateSubmodules
+                            ? "No tracking branch found. Ignoring pull of main repo and updated submodules only."
+                            : "No tracking branch found. Ignoring pull."
+                    );
+                    return { status: "skipped", reason: "no-upstream" };
+                }
+
+                await this.git.fetch();
+                const upstreamCommit = await this.git.revparse([
+                    branchInfo.tracking,
+                ]);
+
+                if (localCommit !== upstreamCommit) {
+                    if (
+                        this.plugin.settings.syncMethod === "merge" ||
+                        this.plugin.settings.syncMethod === "rebase"
+                    ) {
+                        try {
+                            const args = [branchInfo.tracking];
+
+                            if (this.plugin.settings.mergeStrategy !== "none") {
+                                args.push(
+                                    `--strategy-option=${this.plugin.settings.mergeStrategy}`
+                                );
+                            }
+
+                            switch (this.plugin.settings.syncMethod) {
+                                case "merge":
+                                    await this.git.merge(args);
+                                    break;
+                                case "rebase": {
+                                    if (
+                                        this.plugin.settings.rebaseAutoStash ===
+                                        "enabled"
+                                    ) {
+                                        args.push("--autostash");
+                                    } else if (
+                                        this.plugin.settings.rebaseAutoStash ===
+                                        "disabled"
+                                    ) {
+                                        args.push("--no-autostash");
+                                    }
+                                    await this.git.rebase(args);
+                                    break;
+                                }
+                            }
+                        } catch (error) {
+                            await this.throwConflictError(error);
+                        }
+                    } else if (this.plugin.settings.syncMethod === "reset") {
+                        await this.git.raw([
                             "update-ref",
                             `refs/heads/${branchInfo.current}`,
                             upstreamCommit,
-                        ],
-                        (err) => this.onError(err)
+                        ]);
+                        await this.git.reset([]);
+                    }
+                    const afterMergeCommit = await this.git.revparse([
+                        branchInfo.current,
+                    ]);
+
+                    if (afterMergeCommit === localCommit) {
+                        return { status: "up-to-date" };
+                    }
+
+                    this.app.workspace.trigger("obsidian-git:head-change");
+
+                    const filesChanged = await this.git.diff([
+                        `${localCommit}..${afterMergeCommit}`,
+                        "--name-only",
+                    ]);
+
+                    const changedPaths = filesChanged
+                        .split(/\r\n|\r|\n/)
+                        .filter((value) => value.length > 0);
+                    const vaultFiles = changedPaths.filter((filePath) =>
+                        this.isPathInsideVault(filePath)
                     );
-                    await this.unstageAll({});
-                } catch (err) {
-                    this.plugin.displayError(
-                        `Sync failed (${this.plugin.settings.syncMethod}): ${err.message}`
-                    );
-                }
-            }
-            dispatchEvent(new CustomEvent("git-head-update"));
-
-            const afterMergeCommit = await this.git.revparse(
-                [branchInfo.current!],
-                (err) => this.onError(err)
-            );
-
-            const filesChanged = await this.git.diff([
-                `${localCommit}..${afterMergeCommit}`,
-                "--name-only",
-            ]);
-
-            return filesChanged
-                .split(/\r\n|\r|\n/)
-                .filter((value) => value.length > 0)
-                .map((e) => {
-                    return <FileStatusResult>{
-                        path: e,
-                        working_dir: "P",
-                        vault_path: this.getVaultPath(e),
+                    return {
+                        status: "updated",
+                        outsideVault: changedPaths.length - vaultFiles.length,
+                        files: vaultFiles.map(
+                            (e) =>
+                                <FileStatusResult>{
+                                    path: e,
+                                    workingDir: "P",
+                                    vaultPath: this.getRelativeVaultPath(e),
+                                }
+                        ),
                     };
-                });
-        } else {
-            return [];
-        }
+                } else {
+                    return { status: "up-to-date" };
+                }
+            } catch (e) {
+                this.convertErrors(e);
+            }
+        });
     }
 
-    async push(): Promise<number> {
-        this.plugin.setState(PluginState.status);
-        const status = await this.git.status();
-        const trackingBranch = status.tracking!;
-        const currentBranch = status.current!;
-        const remoteChangedFiles = (
-            await this.git.diffSummary(
-                [currentBranch, trackingBranch, "--"],
-                (err) => this.onError(err)
-            )
-        ).changed;
-
-        this.plugin.setState(PluginState.push);
-        if (this.plugin.settings.updateSubmodules) {
-            await this.git
-                .env({ ...process.env, OBSIDIAN_GIT: 1 })
-                .subModule(
-                    [
-                        "foreach",
-                        "--recursive",
-                        `tracking=$(git for-each-ref --format='%(upstream:short)' "$(git symbolic-ref -q HEAD)"); echo $tracking; if [ ! -z "$(git diff --shortstat $tracking)" ]; then git push; fi`,
-                    ],
-                    (err) => this.onError(err)
-                );
+    private async throwConflictError(error: unknown): Promise<never> {
+        try {
+            const status = await this.git.status();
+            if (status.conflicted.length > 0) {
+                throw new GitConflictError(status.conflicted, error);
+            }
+        } catch (statusError) {
+            if (statusError instanceof GitConflictError) {
+                throw statusError;
+            }
         }
-        await this.git
-            .env({ ...process.env, OBSIDIAN_GIT: 1 })
-            .push((err) => this.onError(err));
+        throw error;
+    }
 
-        return remoteChangedFiles;
+    async push(): Promise<PushResult> {
+        return this.withGitOperation(GitOperation.push, async () => {
+            try {
+                if (this.plugin.settings.updateSubmodules) {
+                    if (this.getVaultPathspec() == undefined) {
+                        await this.git.subModule([
+                            "foreach",
+                            "--recursive",
+                            `tracking=$(git for-each-ref --format='%(upstream:short)' "$(git symbolic-ref -q HEAD)"); echo $tracking; if [ ! -z "$(git diff --shortstat $tracking)" ]; then git push; fi`,
+                        ]);
+                    } else {
+                        const submodulePaths = await this.getSubmodulePaths();
+                        for (const submodulePath of submodulePaths) {
+                            const submoduleGit = this.git.cwd({
+                                path: submodulePath,
+                                root: false,
+                            });
+                            const submoduleStatus = await submoduleGit.status();
+                            if (
+                                submoduleStatus.tracking &&
+                                submoduleStatus.ahead > 0
+                            ) {
+                                await submoduleGit.push();
+                            }
+                        }
+                    }
+                }
+                const currentBranch = await this.getCurrentBranch();
+
+                if (!currentBranch) {
+                    return { status: "blocked", reason: "no-branch" };
+                }
+
+                const pushTarget = await this.getPushTarget(currentBranch);
+
+                if (!pushTarget && this.plugin.settings.updateSubmodules) {
+                    this.plugin.log(
+                        "No push target found. Ignoring push of main repo and updating submodules only."
+                    );
+                    return { status: "skipped", reason: "no-upstream" };
+                }
+                let remoteChangedFiles: number | null = null;
+                if (pushTarget?.exists) {
+                    remoteChangedFiles = (
+                        await this.git.diffSummary([
+                            currentBranch,
+                            pushTarget.ref,
+                            "--",
+                        ])
+                    ).changed;
+                }
+
+                await this.git.push();
+
+                return remoteChangedFiles === 0
+                    ? { status: "up-to-date" }
+                    : { status: "pushed", files: remoteChangedFiles };
+            } catch (e) {
+                this.convertErrors(e);
+            }
+        });
+    }
+
+    /**
+     * Returns the remote-tracking ref that represents where an argument-less
+     * `git push` sends the current branch. Unlike the upstream ref, this takes
+     * push.default, branch.<name>.pushRemote and remote.pushDefault into
+     * account. The ref can be configured even when the remote branch has not
+     * been created yet.
+     */
+    private async getPushTarget(
+        currentBranch: string
+    ): Promise<{ ref: string; exists: boolean } | undefined> {
+        const ref = (
+            await this.git.raw([
+                "for-each-ref",
+                "--format=%(push)",
+                `refs/heads/${currentBranch}`,
+            ])
+        ).trim();
+        if (!ref) {
+            return undefined;
+        }
+
+        const existingRef = (
+            await this.git.raw(["for-each-ref", "--format=%(refname)", ref])
+        ).trim();
+        return { ref, exists: existingRef === ref };
+    }
+
+    /**
+     * Squashes all local commits that have not been pushed yet into a single
+     * commit. Only unpushed history is rewritten (HEAD is soft-reset onto the
+     * push target), so this never requires a force-push and is safe across
+     * multiple devices. The squash commit reuses the message of the most recent
+     * unpushed commit, so a custom, modal or script-derived commit message is
+     * preserved instead of being overwritten by the auto-commit template.
+     * No-op if there is no push target, the push target does not exist yet,
+     * there are fewer than two unpushed commits, a merge commit is present in
+     * the unpushed range, or there are staged but uncommitted changes.
+     */
+    async squashAllUnpushedCommits(): Promise<void> {
+        const status = await this.git.status();
+        if (!status.current) {
+            return;
+        }
+        // There is no safe remote base to reset onto before the push target has
+        // been created, or when Git cannot determine an argument-less push
+        // destination. Let the normal push publish the existing history.
+        const pushTarget = await this.getPushTarget(status.current);
+        if (!pushTarget?.exists) {
+            return;
+        }
+        // A soft reset keeps the index, so any staged but uncommitted changes
+        // would be folded into the squash commit, silently committing work the
+        // user did not intend to. Abort the squash and let the push proceed
+        // with the existing history untouched.
+        const staged = (
+            await this.git.raw(["diff", "--cached", "--name-only"])
+        ).trim();
+        if (staged.length > 0) {
+            return;
+        }
+        const range = `${pushTarget.ref}..HEAD`;
+        const unpushed = parseInt(
+            (await this.git.raw(["rev-list", "--count", range])).trim(),
+            10
+        );
+        if (unpushed < 2) {
+            return;
+        }
+        // Flattening a merge commit would lose its structure, so skip those.
+        const merges = parseInt(
+            (
+                await this.git.raw(["rev-list", "--merges", "--count", range])
+            ).trim(),
+            10
+        );
+        if (merges > 0) {
+            return;
+        }
+        // Capture the current tip before rewriting so the squash commit can
+        // reuse its message (commit -C) rather than the auto-commit template.
+        const oldHead = (await this.git.raw(["rev-parse", "HEAD"])).trim();
+        await this.withGitOperation(GitOperation.commit, async () => {
+            // Soft reset keeps the index and working tree, so all unpushed
+            // changes stay staged and are re-committed as a single commit.
+            await this.git.reset(["--soft", pushTarget.ref]);
+            await this.git.raw(["commit", "-C", oldHead]);
+            this.app.workspace.trigger("obsidian-git:head-change");
+        });
     }
 
     async getUnpushedCommits(): Promise<number> {
-        const status = await this.git.status();
-        const trackingBranch = status.tracking;
-        const currentBranch = status.current;
+        const currentBranch = await this.getCurrentBranch();
 
-        if (trackingBranch == null || currentBranch == null) {
+        if (currentBranch == null) {
+            return 0;
+        }
+
+        const pushTarget = await this.getPushTarget(currentBranch);
+        if (!pushTarget) {
+            return 0;
+        }
+        if (!pushTarget.exists) {
+            this.plugin.log(
+                `Push target ${pushTarget.ref} does not exist on the remote yet.`
+            );
             return 0;
         }
 
         const remoteChangedFiles = (
-            await this.git.diffSummary(
-                [currentBranch, trackingBranch, "--"],
-                (err) => this.onError(err)
-            )
+            await this.git.diffSummary([currentBranch, pushTarget.ref, "--"])
         ).changed;
 
         return remoteChangedFiles;
@@ -486,20 +1108,32 @@ export class SimpleGit extends GitManager {
         if (this.plugin.settings.updateSubmodules === true) {
             return true;
         }
-        const status = await this.git.status((err) => this.onError(err));
-        const trackingBranch = status.tracking!;
-        const currentBranch = status.current!;
-        const remoteChangedFiles = (
-            await this.git.diffSummary([currentBranch, trackingBranch, "--"])
-        ).changed;
+        const currentBranch = await this.getCurrentBranch();
+        if (!currentBranch) {
+            this.plugin.log("During canPush check, no current branch found.");
+            return false;
+        }
 
-        return remoteChangedFiles !== 0;
+        const pushTarget = await this.getPushTarget(currentBranch);
+        if (!pushTarget) {
+            return false;
+        }
+        if (!pushTarget.exists) {
+            return true;
+        }
+
+        const [currentCommit, pushedCommit] = await Promise.all([
+            this.git.revparse([currentBranch]),
+            this.git.revparse([pushTarget.ref]),
+        ]);
+
+        return currentCommit !== pushedCommit;
     }
 
     async checkRequirements(): Promise<
         "valid" | "missing-repo" | "missing-git"
     > {
-        if (!this.isGitInstalled()) {
+        if (!(await this.isGitInstalled())) {
             return "missing-git";
         }
         if (!(await this.git.checkIsRepo())) {
@@ -508,28 +1142,55 @@ export class SimpleGit extends GitManager {
         return "valid";
     }
 
-    async branchInfo(): Promise<BranchInfo> {
-        const status = await this.git.status((err) => this.onError(err));
-        const branches = await this.git.branch(["--no-color"], (err) =>
-            this.onError(err)
-        );
+    /**
+     * Returns the checked out branch, or undefined if HEAD is detached. Unlike
+     * `git status`, this doesn't scan the working tree.
+     */
+    private async getCurrentBranch(): Promise<string | undefined> {
+        const branch = await this.git.raw([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ]);
+        return branch.trim() || undefined;
+    }
 
-        return {
-            current: status.current || undefined,
-            tracking: status.tracking || undefined,
-            branches: branches.all,
-        };
+    async branchInfo(): Promise<BranchInfo> {
+        const [current, refs] = await Promise.all([
+            this.getCurrentBranch(),
+            this.git.raw([
+                "branch",
+                "--list",
+                "--no-color",
+                "--format=%(refname)%00%(upstream:short)",
+            ]),
+        ]);
+
+        let tracking: string | undefined;
+        const branches: string[] = [];
+        for (const line of refs.split("\n")) {
+            const [ref, upstream] = line.split("\0");
+            if (!ref?.startsWith("refs/heads/")) continue;
+            const branch = ref.slice("refs/heads/".length);
+            branches.push(branch);
+            if (branch === current) {
+                tracking = upstream || undefined;
+            }
+        }
+
+        return { current, tracking, branches };
     }
 
     async getRemoteUrl(remote: string): Promise<string | undefined> {
         try {
-            await this.git.remote(["get-url", remote]);
+            return (await this.git.remote(["get-url", remote])) || undefined;
         } catch (error) {
             // Verify the error is at least not about git is not found or similar. Checks if the remote exists or not
-            if (error.toString().contains(remote)) {
+            if (String(error).contains(remote)) {
                 return undefined;
             } else {
-                this.onError(error);
+                throw error;
             }
         }
     }
@@ -538,35 +1199,52 @@ export class SimpleGit extends GitManager {
     async log(
         file: string | undefined,
         relativeToVault = true,
-        limit?: number
+        limit?: number,
+        ref?: string
     ): Promise<(LogEntry & { fileName?: string })[]> {
         let path: string | undefined;
         if (file) {
-            path = this.asRepositoryRelativePath(file, relativeToVault);
+            path = this.getRelativeRepoPath(file, relativeToVault);
         }
-        const res = await this.git.log(
-            {
-                file: path,
-                maxCount: limit,
-                "-m": null,
-                "--name-status": null,
-            },
-            (err) => this.onError(err)
-        );
+        const opts: Record<string, unknown> = {
+            file: path,
+            maxCount: limit,
+            // Ensures that the changed files are listed for merge commits as well and the commit is not repeated for each parent.
+            // This only lists the changed files for the first parent.
+            "--diff-merges": "first-parent",
+            "--name-status": null,
+        };
+        if (ref) {
+            opts[ref] = null;
+        }
+        const res = await this.git.log(opts);
 
-        return res.all.map((e) => ({
+        return res.all.map<LogEntry>((e) => ({
             ...e,
-            refs: e.refs.split(", "),
+            author: {
+                name: e.author_name,
+                email: e.author_email,
+            },
+            refs: e.refs.split(", ").filter((e) => e.length > 0),
             diff: {
                 ...e.diff!,
                 files:
-                    e.diff?.files.map((f) => ({
-                        ...f,
-                        status: f.status!,
-                        path: f.file,
-                        hash: e.hash,
-                        vault_path: this.getVaultPath(f.file),
-                    })) ?? [],
+                    e.diff?.files.map<DiffFile>((f) => {
+                        const from = "from" in f ? f.from : undefined;
+                        return {
+                            ...f,
+                            status: "status" in f ? f.status! : "M",
+                            path: f.file,
+                            hash: e.hash,
+                            vaultPath: this.getRelativeVaultPath(f.file),
+                            fromPath: from,
+                            fromVaultPath:
+                                from != undefined
+                                    ? this.getRelativeVaultPath(from)
+                                    : undefined,
+                            binary: f.binary,
+                        };
+                    }) ?? [],
             },
             fileName: e.diff?.files.first()?.file,
         }));
@@ -577,53 +1255,131 @@ export class SimpleGit extends GitManager {
         file: string,
         relativeToVault = true
     ): Promise<string> {
-        const path = this.asRepositoryRelativePath(file, relativeToVault);
+        const path = this.getRelativeRepoPath(file, relativeToVault);
 
-        return this.git.show([commitHash + ":" + path], (err) =>
-            this.onError(err)
-        );
+        // `--textconv` applies a configured diff.*.textconv filter (e.g.
+        // git-crypt, git-secret), matching what `git diff` shows.
+        return this.git.show(["--textconv", commitHash + ":" + path]);
+    }
+
+    private async getLocalBranchUpstream(
+        localBranchName: string
+    ): Promise<string | undefined> {
+        // Returns the configured upstream ref for a local branch (e.g. `origin/main`), using
+        // Return undefined when no upstream exists or if git throws an error.
+        try {
+            const upstream = await this.git.raw([
+                "rev-parse",
+                "--abbrev-ref",
+                `${localBranchName}@{upstream}`,
+            ]);
+            const trimmed = upstream.trim();
+            return trimmed.length > 0 ? trimmed : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    private getAvailableLocalBranchName(
+        remoteBranchName: string,
+        remote: string,
+        existingBranchNames: string[]
+    ): string {
+        // Chooses a local branch name that does not collide with `existingBranchNames`.
+        // Prefers `remoteBranchName`, then `<remoteBranchName>-<remote>`, then that base with `-1`, `-2`, …
+        //
+        // Ex.: for a remote branch `origin/my-branch`
+        // - `my-branch` is preferred
+        // - `my-branch-origin` is next
+        // - `my-branch-origin-1` is next
+        // - `my-branch-origin-2` is next
+        // - etc.
+
+        const preferred = remoteBranchName;
+        if (!existingBranchNames.includes(preferred)) {
+            return preferred;
+        }
+        const base = `${remoteBranchName}-${remote}`;
+        let candidate = base;
+        let n = 0;
+        while (existingBranchNames.includes(candidate)) {
+            n += 1;
+            candidate = `${base}-${n}`;
+        }
+        return candidate;
     }
 
     async checkout(branch: string, remote?: string): Promise<void> {
-        if (remote) {
-            branch = `${remote}/${branch}`;
-        }
-        await this.git.checkout(branch, (err) => this.onError(err));
-        if (this.plugin.settings.submoduleRecurseCheckout) {
-            const submodulePaths = await this.getSubmodulePaths();
-            for (const submodulePath of submodulePaths) {
-                const branchSummary = await this.git
-                    .cwd({ path: submodulePath, root: false })
-                    .branch();
-                if (Object.keys(branchSummary.branches).includes(branch)) {
-                    await this.git
+        return this.withGitOperation(GitOperation.checkout, async () => {
+            if (remote) {
+                // If we're trying to checkout a remote branch we'll either switch to an existing local branch that
+                // already tracks it, or create a new local branch from the remote tip (name may be disambiguated).
+                const remoteBranch = `${remote}/${branch}`;
+                const branchInfo = await this.branchInfo();
+                const localBranchExists = branchInfo.branches.includes(branch);
+
+                // We found a local branch with the "correct" name, but it might track
+                // a different remote, so we'll double check before proceeding.
+                const existingBranchTracksRemote =
+                    localBranchExists &&
+                    (await this.getLocalBranchUpstream(branch)) ===
+                        remoteBranch;
+
+                if (existingBranchTracksRemote) {
+                    // The local branch already exists AND it tracked the correct remote, so we can simply switch to it.
+                    await this.git.checkout(branch);
+                } else {
+                    // The local branch doesn't exist or it tracks a different remote, so we'll need to create a new local branch.
+                    // First we need to find a suitable name for the new local branch.
+                    const localBranchName = this.getAvailableLocalBranchName(
+                        branch,
+                        remote,
+                        branchInfo.branches
+                    );
+
+                    // Finally, we can use `git checkout -b` to create the new local branch and set it to track the remote branch.
+                    await this.git.checkout([
+                        "-b",
+                        localBranchName,
+                        remoteBranch,
+                    ]);
+                }
+            } else {
+                // Checkout an existing local branch (no remote specified).
+                await this.git.checkout(branch);
+            }
+
+            if (this.plugin.settings.submoduleRecurseCheckout) {
+                const submodulePaths = await this.getSubmodulePaths();
+                for (const submodulePath of submodulePaths) {
+                    const branchSummary = await this.git
                         .cwd({ path: submodulePath, root: false })
-                        .checkout(branch, (err) => this.onError(err));
+                        .branch();
+                    if (Object.keys(branchSummary.branches).includes(branch)) {
+                        await this.git
+                            .cwd({ path: submodulePath, root: false })
+                            .checkout(branch);
+                    }
                 }
             }
-        }
+        });
     }
 
     async createBranch(branch: string): Promise<void> {
-        await this.git.checkout(["-b", branch], (err) => this.onError(err));
+        await this.git.checkout(["-b", branch]);
     }
 
     async deleteBranch(branch: string, force: boolean): Promise<void> {
-        await this.git.branch([force ? "-D" : "-d", branch], (err) =>
-            this.onError(err)
-        );
+        await this.git.branch([force ? "-D" : "-d", branch]);
     }
 
     async branchIsMerged(branch: string): Promise<boolean> {
-        const notMergedBranches = await this.git.branch(
-            ["--no-merged"],
-            (err) => this.onError(err)
-        );
+        const notMergedBranches = await this.git.branch(["--no-merged"]);
         return !notMergedBranches.all.contains(branch);
     }
 
     async init(): Promise<void> {
-        await this.git.init(false, (err) => this.onError(err));
+        await this.git.init(false);
     }
 
     async clone(url: string, dir: string, depth?: number): Promise<void> {
@@ -633,61 +1389,60 @@ export class SimpleGit extends GitManager {
                 (this.app.vault.adapter as FileSystemAdapter).getBasePath(),
                 dir
             ),
-            depth ? ["--depth", `${depth}`] : [],
-            (err) => this.onError(err)
+            depth ? ["--depth", `${depth}`] : []
         );
+
+        // Set required attributes like `absoluteRepoPath` and add the script to the exclude file if needed.
+        await this.setGitInstance();
     }
 
-    async setConfig(path: string, value: any): Promise<void> {
+    async setConfig(path: string, value: string | undefined): Promise<void> {
         if (value == undefined) {
-            await this.git.raw(["config", "--local", "--unset", path]);
+            if ((await this.getConfig(path, "local")) !== undefined) {
+                await this.git.raw(["config", "--local", "--unset-all", path]);
+            }
         } else {
-            await this.git.addConfig(path, value, (err) => this.onError(err));
+            await this.git.addConfig(path, value, false, "local");
         }
     }
 
-    async getConfig(path: string): Promise<any> {
-        const config = await this.git.listConfig("local", (err) =>
-            this.onError(err)
+    async getConfig(
+        path: string,
+        scope: "local" | "global" | "all" = "local"
+    ): Promise<string | undefined> {
+        const res = await this.git.getConfig(
+            path.toLowerCase(),
+            scope == "all" ? undefined : scope
         );
-        return config.all[path];
+        return res.value ?? undefined;
     }
 
     async fetch(remote?: string): Promise<void> {
-        await this.git.fetch(remote != undefined ? [remote] : [], (err) =>
-            this.onError(err)
-        );
+        return this.withGitOperation(GitOperation.fetch, async () => {
+            await this.git.fetch(remote != undefined ? [remote] : []);
+        });
     }
 
     async setRemote(name: string, url: string): Promise<void> {
         if ((await this.getRemotes()).includes(name))
-            await this.git.remote(["set-url", name, url], (err) =>
-                this.onError(err)
-            );
+            await this.git.remote(["set-url", name, url]);
         else {
-            await this.git.remote(["add", name, url], (err) =>
-                this.onError(err)
-            );
+            await this.git.remote(["add", name, url]);
         }
     }
 
     async getRemoteBranches(remote: string): Promise<string[]> {
-        const res = await this.git.branch(
-            ["-r", "--list", `${remote}*`],
-            (err) => this.onError(err)
-        );
-        console.log(remote);
-        console.log(res);
+        const res = await this.git.branch(["-r", "--list", `${remote}*`]);
 
         const list = [];
         for (const item in res.branches) {
-            list.push(res.branches[item].name);
+            list.push(res.branches[item]!.name);
         }
         return list;
     }
 
     async getRemotes() {
-        const res = await this.git.remote([], (err) => this.onError(err));
+        const res = await this.git.remote([]);
         if (res) {
             return res.trim().split("\n");
         } else {
@@ -699,36 +1454,37 @@ export class SimpleGit extends GitManager {
         await this.git.removeRemote(remoteName);
     }
 
+    /**
+     * @param remoteBranch - The remote branch to set as upstream, in the format "remote/branch"
+     */
     async updateUpstreamBranch(remoteBranch: string) {
         try {
             // git 1.8+
             await this.git.branch(["--set-upstream-to", remoteBranch]);
-        } catch (e) {
-            console.error(e);
+        } catch {
             try {
                 // git 1.7 - 1.8
                 await this.git.branch(["--set-upstream", remoteBranch]);
-            } catch (e) {
-                console.error(e);
-                // fallback
-                await this.git.push(
-                    // A type error occurs here because the third element could be undefined.
-                    // However, it is unlikely to be undefined due to the `remoteBranch`'s format, and error handling is in place.
-                    // Therefore, we temporarily ignore the error.
-                    // @ts-ignore
-                    ["--set-upstream", ...splitRemoteBranch(remoteBranch)],
-                    (err) => this.onError(err)
-                );
+            } catch {
+                // fallback for when setting upstream branch to a branch that does not exist on the remote yet. Setting it with push instead.
+                const [remote, remoteBranchName] =
+                    splitRemoteBranch(remoteBranch);
+                const branchInfo = await this.branchInfo();
+                await this.git.push([
+                    "--set-upstream",
+                    remote,
+                    `${branchInfo.current}:${remoteBranchName}`,
+                ]);
             }
         }
     }
 
-    updateGitPath(gitPath: string) {
-        this.setGitInstance();
+    updateGitPath(_: string): Promise<void> {
+        return this.setGitInstance();
     }
 
-    updateBasePath(basePath: string) {
-        this.setGitInstance(true);
+    updateBasePath(_: string): Promise<void> {
+        return this.setGitInstance(true);
     }
 
     async getDiffString(
@@ -750,10 +1506,26 @@ export class SimpleGit extends GitManager {
         return await this.git.diff([`${commit1}..${commit2}`, "--", file]);
     }
 
-    private async getSubmoduleOfFile(
+    async rawCommand(command: string): Promise<string> {
+        const parts = command.split(" "); // Very simple parsing, may need string-argv
+        const firstPart = parts[0];
+        if (firstPart === undefined) return "";
+        const res = await this.git.raw(firstPart, ...parts.slice(1));
+        return res;
+    }
+
+    async getSubmoduleOfFile(
         repositoryRelativeFile: string
     ): Promise<{ submodule: string; relativeFilepath: string } | undefined> {
         // Documentation: https://git-scm.com/docs/git-rev-parse
+
+        if (
+            !(await this.app.vault.adapter.exists(
+                path.dirname(repositoryRelativeFile)
+            ))
+        ) {
+            return undefined;
+        }
 
         // git -C <dir-of-file> rev-parse --show-toplevel
         // returns the submodules repository root as an absolute path
@@ -794,53 +1566,89 @@ export class SimpleGit extends GitManager {
     }
 
     async getLastCommitTime(): Promise<Date | undefined> {
-        const res = await this.git.log({ n: 1 }, (err) => this.onError(err));
-        if (res != null && res.latest != null) {
-            return new Date(res.latest.date);
+        try {
+            const res = await this.git.log({ n: 1 });
+            if (res != null && res.latest != null) {
+                return new Date(res.latest.date);
+            }
+        } catch (error) {
+            if (error instanceof GitError) {
+                if (error.message.contains("does not have any commits yet")) {
+                    return undefined;
+                }
+            } else {
+                throw error;
+            }
         }
+        return undefined;
     }
 
-    private isGitInstalled(): boolean {
+    private async isGitInstalled(): Promise<boolean> {
         // https://github.com/steveukx/git-js/issues/402
-        const command = spawnSync(
-            this.plugin.localStorage.getGitPath() || "git",
-            ["--version"],
-            {
-                stdio: "ignore",
-            }
-        );
+        const gitPath = this.plugin.localStorage.getGitPath();
+        const command = await spawnAsync(gitPath || "git", ["--version"], {});
 
         if (command.error) {
-            console.error(command.error);
-            return false;
+            if (Platform.isWin && !gitPath) {
+                this.plugin.log(
+                    `Git not found in PATH. Checking standard installation path(${DEFAULT_WIN_GIT_PATH}) of Git for Windows.`
+                );
+                const command = await spawnAsync(DEFAULT_WIN_GIT_PATH, [
+                    "--version",
+                ]);
+                if (command.error) {
+                    console.error(command.error);
+                    return false;
+                } else {
+                    this.useDefaultWindowsGitPath = true;
+                }
+            } else {
+                console.error(command.error);
+                return false;
+            }
+        } else {
+            this.useDefaultWindowsGitPath = false;
         }
         return true;
     }
 
-    private onError(error: Error | null) {
-        if (error) {
+    private convertErrors(error: unknown): never {
+        if (error instanceof GitError) {
+            const message = String(error.message);
             const networkFailure =
-                error.message.contains("Could not resolve host") ||
-                error.message.match(
+                message.contains("Could not resolve host") ||
+                message.contains("Unable to resolve host") ||
+                message.contains("Unable to open connection") ||
+                message.match(
                     /ssh: connect to host .*? port .*?: Operation timed out/
-                ) ||
-                error.message.match(
+                ) != null ||
+                message.match(
                     /ssh: connect to host .*? port .*?: Network is unreachable/
-                );
-            if (!networkFailure) {
-                this.plugin.displayError(error.message);
-                this.plugin.setState(PluginState.idle);
-            } else if (!this.plugin.offlineMode) {
-                this.plugin.displayError(
-                    "Git: Going into offline mode. Future network errors will no longer be displayed.",
-                    2000
-                );
-            }
-
+                ) != null ||
+                message.match(
+                    /ssh: connect to host .*? port .*?: Undefined error: 0/
+                ) != null;
             if (networkFailure) {
-                this.plugin.offlineMode = true;
-                this.plugin.setState(PluginState.idle);
+                throw new NoNetworkError(message);
             }
+        }
+        throw error;
+    }
+
+    async isFileTrackedByLFS(filePath: string): Promise<boolean> {
+        try {
+            // Checks if Gits filter attribute is set to lfs for the file, which means it is (or will be) tracked by LFS.
+            const result = await this.git.raw([
+                "check-attr",
+                "filter",
+                filePath,
+            ]);
+            return result.includes("filter: lfs");
+        } catch (error) {
+            const errorMessage =
+                error instanceof Error ? error.message : String(error);
+            // eslint-disable-next-line preserve-caught-error -- Error.cause is unavailable with the project's ES2021 target.
+            throw new Error(`Error checking LFS status: ${errorMessage}`);
         }
     }
 }
@@ -853,7 +1661,7 @@ export const zeroCommit: BlameCommit = {
 
 // Parse git blame porcelain format: https://git-scm.com/docs/git-blame#_the_porcelain_format
 function parseBlame(blameOutputUnnormalized: string): Blame {
-    const blameOutput = blameOutputUnnormalized.replace("\r\n", "\n");
+    const blameOutput = blameOutputUnnormalized.replaceAll("\r\n", "\n");
 
     const blameLines = blameOutput.split("\n");
 
@@ -866,27 +1674,28 @@ function parseBlame(blameOutputUnnormalized: string): Blame {
     };
 
     let line = 1;
-    for (let bi = 0; bi < blameLines.length; ) {
-        if (startsWithNonWhitespace(blameLines[bi])) {
-            const lineInfo = blameLines[bi].split(" ");
+    for (let bi = 0; bi < blameLines.length;) {
+        const blameLine = blameLines[bi];
+        if (startsWithNonWhitespace(blameLine)) {
+            const lineInfo = blameLine.split(" ");
 
             const commitHash = parseLineInfoInto(lineInfo, line, result);
             bi++;
 
             // parse header values until a tab is encountered
             for (; startsWithNonWhitespace(blameLines[bi]); bi++) {
-                const spaceSeparatedHeaderValues = blameLines[bi].split(" ");
+                const spaceSeparatedHeaderValues = blameLines[bi]!.split(" ");
                 parseHeaderInto(spaceSeparatedHeaderValues, result, line);
             }
             finalizeBlameCommitInfo(result.commits.get(commitHash)!);
 
             // skip tab prefixed line
             line += 1;
-        } else if (blameLines[bi] === "" && bi === blameLines.length - 1) {
+        } else if (blameLine === "" && bi === blameLines.length - 1) {
             // EOF
         } else {
             throw Error(
-                `Expected non-whitespace line or EOF, but found: ${blameLines[bi]}`
+                `Expected non-whitespace line or EOF, but found: ${blameLine}`
             );
         }
         bi++;
@@ -896,15 +1705,24 @@ function parseBlame(blameOutputUnnormalized: string): Blame {
 
 function parseLineInfoInto(lineInfo: string[], line: number, result: Blame) {
     const hash = lineInfo[0];
+    const originalLine = lineInfo[1];
+    const finalLine = lineInfo[2];
+    if (
+        hash === undefined ||
+        originalLine === undefined ||
+        finalLine === undefined
+    ) {
+        throw Error(`Invalid git-blame line info: ${lineInfo.join(" ")}`);
+    }
     result.hashPerLine.push(hash);
-    result.originalFileLineNrPerLine.push(parseInt(lineInfo[1]));
-    result.finalFileLineNrPerLine.push(parseInt(lineInfo[2]));
-    lineInfo.length >= 4 &&
-        result.groupSizePerStartingLine.set(line, parseInt(lineInfo[3]));
+    result.originalFileLineNrPerLine.push(parseInt(originalLine));
+    result.finalFileLineNrPerLine.push(parseInt(finalLine));
+    if (lineInfo.length >= 4)
+        result.groupSizePerStartingLine.set(line, parseInt(lineInfo[3]!));
 
-    if (parseInt(lineInfo[2]) !== line) {
+    if (parseInt(finalLine) !== line) {
         throw Error(
-            `git-blame output is out of order: ${line} vs ${lineInfo[2]}`
+            `git-blame output is out of order: ${line} vs ${finalLine}`
         );
     }
 
@@ -915,6 +1733,9 @@ function parseHeaderInto(header: string[], out: Blame, line: number) {
     const key = header[0];
     const value = header.slice(1).join(" ");
     const commitHash = out.hashPerLine[line];
+    if (commitHash === undefined) {
+        throw Error(`No commit hash found for git-blame line ${line}`);
+    }
     const commit =
         out.commits.get(commitHash) ||
         <BlameCommit>{
@@ -961,6 +1782,8 @@ function parseHeaderInto(header: string[], out: Blame, line: number) {
         case "filename":
             commit.previous!.filename = value;
             break;
+        case undefined:
+            break;
     }
     out.commits.set(commitHash, commit);
 }
@@ -987,8 +1810,9 @@ function isUndefinedOrEmptyObject(obj: object | undefined | null): boolean {
     return !obj || Object.keys(obj).length === 0;
 }
 
-function startsWithNonWhitespace(str: string): boolean {
-    return str.length > 0 && str[0].trim() === str[0];
+function startsWithNonWhitespace(str: string | undefined): str is string {
+    if (str === undefined) return false;
+    return str.length > 0 && str[0]!.trim() === str[0];
 }
 
 function removeEmailBrackets(gitEmail: string) {

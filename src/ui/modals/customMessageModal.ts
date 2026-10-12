@@ -1,39 +1,35 @@
-import { SuggestModal } from "obsidian";
-import ObsidianGit from "src/main";
+import { moment, SuggestModal } from "obsidian";
+import type ObsidianGit from "src/main";
 
 export class CustomMessageModal extends SuggestModal<string> {
-    plugin: ObsidianGit;
-
     resolve:
-        | ((value: string | PromiseLike<string> | undefined) => void)
-        | null = null;
-    constructor(plugin: ObsidianGit, private readonly fromAutoBackup: boolean) {
+        ((value: string | PromiseLike<string> | undefined) => void) | null =
+        null;
+    constructor(private readonly plugin: ObsidianGit) {
         super(plugin.app);
-        this.plugin = plugin;
         this.setPlaceholder(
             "Type your message and select optional the version with the added date."
         );
     }
-    open(): Promise<string> {
-        super.open();
+
+    openAndGetResult(): Promise<string | undefined> {
         return new Promise((resolve) => {
             this.resolve = resolve;
+            this.open();
         });
     }
 
     onClose() {
-        if (this.resolve) this.resolve(undefined);
-    }
-
-    selectSuggestion(value: string, evt: MouseEvent | KeyboardEvent): void {
-        if (this.resolve) this.resolve(value);
-        super.selectSuggestion(value, evt);
+        // onClose gets called before onChooseItem
+        void new Promise((resolve) => window.setTimeout(resolve, 10)).then(
+            () => {
+                if (this.resolve) this.resolve(undefined);
+            }
+        );
     }
 
     getSuggestions(query: string): string[] {
-        const date = (window as any)
-            .moment()
-            .format(this.plugin.settings.commitDateFormat);
+        const date = moment().format(this.plugin.settings.commitDateFormat);
         if (query == "") query = "...";
         return [query, `${date}: ${query}`, `${query}: ${date}`];
     }
@@ -42,5 +38,7 @@ export class CustomMessageModal extends SuggestModal<string> {
         el.innerText = value;
     }
 
-    onChooseSuggestion(item: string, _: MouseEvent | KeyboardEvent) {}
+    onChooseSuggestion(value: string, __: MouseEvent | KeyboardEvent) {
+        if (this.resolve) this.resolve(value);
+    }
 }

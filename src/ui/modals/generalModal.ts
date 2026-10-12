@@ -1,4 +1,5 @@
 import { SuggestModal } from "obsidian";
+import type ObsidianGit from "src/main";
 
 export interface OptionalGeneralModalConfig {
     options?: string[];
@@ -6,6 +7,7 @@ export interface OptionalGeneralModalConfig {
     allowEmpty?: boolean;
     onlySelection?: boolean;
     initialValue?: string;
+    obscure?: boolean;
 }
 interface GeneralModalConfig {
     options: string[];
@@ -13,6 +15,7 @@ interface GeneralModalConfig {
     allowEmpty: boolean;
     onlySelection: boolean;
     initialValue?: string;
+    obscure: boolean;
 }
 
 const generalModalConfigDefaults: GeneralModalConfig = {
@@ -21,46 +24,61 @@ const generalModalConfigDefaults: GeneralModalConfig = {
     allowEmpty: false,
     onlySelection: false,
     initialValue: undefined,
+    obscure: false,
 };
 
 export class GeneralModal extends SuggestModal<string> {
-    resolve: (
+    resolve!: (
         value: string | undefined | PromiseLike<string | undefined>
     ) => void;
     config: GeneralModalConfig;
 
-    constructor(config: OptionalGeneralModalConfig) {
-        super(app);
+    constructor(plugin: ObsidianGit, config: OptionalGeneralModalConfig) {
+        super(plugin.app);
         this.config = { ...generalModalConfigDefaults, ...config };
         this.setPlaceholder(this.config.placeholder);
+        if (this.config.obscure) {
+            this.inputEl.type = "password";
+            const promptContainer = this.containerEl.querySelector(
+                ".prompt-input-container"
+            )!;
+            promptContainer.addClass("git-obscure-prompt");
+            promptContainer.setAttr("git-is-obscured", "true");
+            const obscureSwitchButton = promptContainer?.createDiv({
+                cls: "search-input-clear-button",
+            });
+            obscureSwitchButton.style.marginRight = "32px";
+            obscureSwitchButton.id = "git-show-password";
+            obscureSwitchButton.addEventListener("click", () => {
+                const isObscured = promptContainer.getAttr("git-is-obscured");
+                if (isObscured === "true") {
+                    this.inputEl.type = "text";
+                    promptContainer.setAttr("git-is-obscured", "false");
+                } else {
+                    this.inputEl.type = "password";
+                    promptContainer.setAttr("git-is-obscured", "true");
+                }
+            });
+        }
     }
 
-    open(): Promise<string> {
-        super.open();
-
-        if (this.config.initialValue != undefined) {
-            this.inputEl.value = this.config.initialValue;
-            this.inputEl.dispatchEvent(new Event("input"));
-        }
-
+    openAndGetResult(): Promise<string | undefined> {
         return new Promise((resolve) => {
             this.resolve = resolve;
+            this.open();
+            if (this.config.initialValue != undefined) {
+                this.inputEl.value = this.config.initialValue;
+                this.inputEl.dispatchEvent(new Event("input"));
+            }
         });
     }
 
-    selectSuggestion(value: string, evt: MouseEvent | KeyboardEvent): void {
-        if (this.resolve) {
-            let res;
-            if (this.config.allowEmpty && value === " ") res = "";
-            else if (value === "...") res = undefined;
-            else res = value;
-            this.resolve(res);
-        }
-        super.selectSuggestion(value, evt);
-    }
-
     onClose() {
-        if (this.resolve) this.resolve(undefined);
+        void new Promise((resolve) => window.setTimeout(resolve, 10)).then(
+            () => {
+                if (this.resolve) this.resolve(undefined);
+            }
+        );
     }
 
     getSuggestions(query: string): string[] {
@@ -74,8 +92,20 @@ export class GeneralModal extends SuggestModal<string> {
     }
 
     renderSuggestion(value: string, el: HTMLElement): void {
-        el.setText(value);
+        if (this.config.obscure) {
+            el.hide();
+        } else {
+            el.setText(value);
+        }
     }
 
-    onChooseSuggestion(item: string, evt: MouseEvent | KeyboardEvent) {}
+    onChooseSuggestion(value: string, _: MouseEvent | KeyboardEvent) {
+        if (this.resolve) {
+            let res;
+            if (this.config.allowEmpty && value === " ") res = "";
+            else if (value === "...") res = undefined;
+            else res = value;
+            this.resolve(res);
+        }
+    }
 }

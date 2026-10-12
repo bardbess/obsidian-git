@@ -1,6 +1,6 @@
-import { setIcon } from "obsidian";
-import ObsidianGit from "./main";
-import { PluginState } from "./types";
+import { setIcon, moment } from "obsidian";
+import type ObsidianGit from "./main";
+import { GitOperation, type GitProgress } from "./types";
 
 interface StatusBarMessage {
     message: string;
@@ -9,22 +9,28 @@ interface StatusBarMessage {
 
 export class StatusBar {
     private messages: StatusBarMessage[] = [];
-    private currentMessage: StatusBarMessage | null;
+    private currentMessage: StatusBarMessage | null = null;
     private lastCommitTimestamp?: Date;
     private unPushedCommits?: number;
-    public lastMessageTimestamp: number | null;
+    private progress?: GitProgress;
+    public lastMessageTimestamp: number | null = null;
     private base = "obsidian-git-statusbar-";
-    private iconEl: HTMLElement;
-    private textEl: HTMLElement;
+    private iconEl!: HTMLElement;
+    private conflictEl!: HTMLElement;
+    private pausedEl!: HTMLElement;
+    private textEl!: HTMLElement;
 
     constructor(
         private statusBarEl: HTMLElement,
         private readonly plugin: ObsidianGit
     ) {
-        this.statusBarEl.setAttribute("aria-label-position", "top");
         this.statusBarEl.setAttribute("data-tooltip-position", "top");
 
-        addEventListener("git-refresh", this.refreshCommitTimestamp.bind(this));
+        plugin.registerEvent(
+            plugin.app.workspace.on("obsidian-git:refreshed", () => {
+                this.refreshCommitTimestamp().catch(console.error);
+            })
+        );
     }
 
     public displayMessage(message: string, timeout: number) {
@@ -35,8 +41,20 @@ export class StatusBar {
         this.display();
     }
 
+    public displayProgress(progress: GitProgress) {
+        this.progress = progress;
+        this.display();
+    }
+
+    public clearProgress(display = true) {
+        this.progress = undefined;
+        if (display) this.display();
+    }
+
     public display() {
-        if (this.messages.length > 0 && !this.currentMessage) {
+        if (this.progress) {
+            this.displayState();
+        } else if (this.messages.length > 0 && !this.currentMessage) {
             this.currentMessage = this.messages.shift() as StatusBarMessage;
             this.statusBarEl.addClass(this.base + "message");
             this.statusBarEl.ariaLabel = "";
@@ -62,74 +80,206 @@ export class StatusBar {
         ) {
             this.statusBarEl.empty();
 
+            this.conflictEl = this.statusBarEl.createDiv();
+            this.conflictEl.setAttribute("data-tooltip-position", "top");
+            this.conflictEl.style.float = "left";
+            this.conflictEl.setAttribute("role", "button");
+            this.conflictEl.onclick = () => this.plugin.openMergeConflictHelp();
+            this.conflictEl.onkeydown = (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    this.plugin.openMergeConflictHelp();
+                }
+            };
+
+            this.pausedEl = this.statusBarEl.createDiv();
+            this.pausedEl.setAttribute("data-tooltip-position", "top");
+            this.pausedEl.style.float = "left";
+
             this.iconEl = this.statusBarEl.createDiv();
+            this.iconEl.style.float = "left";
+
             this.textEl = this.statusBarEl.createDiv();
             this.textEl.style.float = "right";
             this.textEl.style.marginLeft = "5px";
-            this.iconEl.style.float = "left";
         }
 
-        switch (this.plugin.state) {
-            case PluginState.idle:
+        if (this.plugin.state.mergeInProgress) {
+            setIcon(this.conflictEl, "git-merge");
+            this.conflictEl.ariaLabel =
+                "Merge in progress. Select for help resolving and finishing the merge.";
+            this.conflictEl.tabIndex = 0;
+            this.conflictEl.style.cursor = "pointer";
+            this.conflictEl.style.marginRight = "5px";
+            this.conflictEl.addClass(this.base + "conflict");
+        } else {
+            this.conflictEl.empty();
+            this.conflictEl.tabIndex = -1;
+            this.conflictEl.style.cursor = "";
+            this.conflictEl.style.marginRight = "";
+        }
+
+        if (this.plugin.localStorage.getPausedAutomatics()) {
+            setIcon(this.pausedEl, "pause-circle");
+            this.pausedEl.ariaLabel =
+                "Automatic routines are currently paused.";
+            this.pausedEl.style.marginRight = "5px";
+            this.pausedEl.addClass(this.base + "paused");
+        } else {
+            this.pausedEl.empty();
+            this.pausedEl.style.marginRight = "";
+        }
+
+        if (this.progress) {
+            this.statusBarEl.ariaLabel = this.getProgressTooltip(
+                "Git operation in progress..."
+            );
+            setIcon(this.iconEl, this.getProgressIcon());
+            this.displayProgressText();
+            this.statusBarEl.addClass(this.base + "progress");
+            this.addMergeHelpToTooltip();
+            return;
+        }
+
+        switch (this.plugin.state.operation) {
+            case GitOperation.idle:
                 this.displayFromNow();
                 break;
-            case PluginState.status:
-                this.statusBarEl.ariaLabel = "Checking repository status...";
-                setIcon(this.iconEl, "refresh-cw");
-                this.statusBarEl.addClass(this.base + "status");
-                break;
-            case PluginState.add:
-                this.statusBarEl.ariaLabel = "Adding files...";
-                setIcon(this.iconEl, "refresh-w");
-                this.statusBarEl.addClass(this.base + "add");
-                break;
-            case PluginState.commit:
+            case GitOperation.commit:
                 this.statusBarEl.ariaLabel = "Committing changes...";
                 setIcon(this.iconEl, "git-commit");
+                this.textEl.empty();
                 this.statusBarEl.addClass(this.base + "commit");
                 break;
-            case PluginState.push:
-                this.statusBarEl.ariaLabel = "Pushing changes...";
+            case GitOperation.push:
+                this.statusBarEl.ariaLabel =
+                    this.getProgressTooltip("Pushing changes...");
                 setIcon(this.iconEl, "upload");
+                this.displayProgressText();
                 this.statusBarEl.addClass(this.base + "push");
                 break;
-            case PluginState.pull:
-                this.statusBarEl.ariaLabel = "Pulling changes...";
+            case GitOperation.pull:
+                this.statusBarEl.ariaLabel =
+                    this.getProgressTooltip("Pulling changes...");
                 setIcon(this.iconEl, "download");
+                this.displayProgressText();
                 this.statusBarEl.addClass(this.base + "pull");
                 break;
-            case PluginState.conflicted:
-                this.statusBarEl.ariaLabel = "You have conflict files...";
-                setIcon(this.iconEl, "alert-circle");
-                this.statusBarEl.addClass(this.base + "conflict");
+            case GitOperation.fetch:
+                this.statusBarEl.ariaLabel = this.getProgressTooltip(
+                    "Fetching from remote..."
+                );
+                setIcon(this.iconEl, "download");
+                this.displayProgressText();
+                this.statusBarEl.addClass(this.base + "fetch");
+                break;
+            case GitOperation.checkout:
+                this.statusBarEl.ariaLabel = this.getProgressTooltip(
+                    "Checking out branch..."
+                );
+                setIcon(this.iconEl, "git-branch");
+                this.displayProgressText();
+                this.statusBarEl.addClass(this.base + "checkout");
                 break;
             default:
                 this.statusBarEl.ariaLabel = "Failed on initialization!";
                 setIcon(this.iconEl, "alert-triangle");
+                this.textEl.empty();
                 this.statusBarEl.addClass(this.base + "failed-init");
                 break;
+        }
+        this.addMergeHelpToTooltip();
+    }
+
+    private addMergeHelpToTooltip(): void {
+        if (!this.plugin.state.mergeInProgress) return;
+
+        const mergeHelp =
+            "Merge in progress. Select the merge icon for help resolving and finishing it.";
+        const current = this.statusBarEl.ariaLabel;
+        this.statusBarEl.ariaLabel = current
+            ? `${mergeHelp}\n${current}`
+            : mergeHelp;
+    }
+
+    private displayProgressText(): void {
+        if (this.progress) {
+            this.textEl.setText(this.getCompactProgressText());
+        } else {
+            this.textEl.empty();
+        }
+    }
+
+    private getProgressTooltip(fallback: string): string {
+        if (!this.progress) return fallback;
+
+        const stage = this.progress.stage ? `${this.progress.stage}: ` : "";
+        if (this.progress.progress === undefined) {
+            return this.progress.stage
+                ? `${this.progress.action}: ${this.progress.stage}...`
+                : `${this.progress.action}...`;
+        }
+
+        const count =
+            this.progress.processed !== undefined &&
+            this.progress.total !== undefined
+                ? ` (${this.progress.processed}/${this.progress.total})`
+                : "";
+        return `${this.progress.action}: ${stage}${Math.round(this.progress.progress)}%${count}`;
+    }
+
+    private getCompactProgressText(): string {
+        if (!this.progress) return "";
+
+        if (this.progress.progress === undefined) {
+            return `${this.progress.action}...`;
+        }
+
+        return `${this.progress.action} ${Math.round(this.progress.progress)}%`;
+    }
+
+    private getProgressIcon(): string {
+        switch (this.progress?.action) {
+            case "Fetching":
+            case "Pulling":
+                return "download";
+            case "Pushing":
+                return "upload";
+            case "Checking out":
+                return "git-branch";
+            case undefined:
+            default:
+                return "git-pull-request";
         }
     }
 
     private displayFromNow(): void {
+        if (!this.plugin.gitReady) {
+            this.statusBarEl.ariaLabel = "Git is not ready";
+            setIcon(this.iconEl, "alert-triangle");
+            this.textEl.empty();
+            this.statusBarEl.addClass(this.base + "failed-init");
+            return;
+        }
+
         const timestamp = this.lastCommitTimestamp;
+        const offlineMode = this.plugin.state.offlineMode;
         if (timestamp) {
-            const moment = (window as any).moment;
             const fromNow = moment(timestamp).fromNow();
             this.statusBarEl.ariaLabel = `${
-                this.plugin.offlineMode ? "Offline: " : ""
+                offlineMode ? "Offline: " : ""
             }Last Commit: ${fromNow}`;
 
-            if (this.unPushedCommits ?? 0 > 0) {
+            if ((this.unPushedCommits ?? 0) > 0) {
                 this.statusBarEl.ariaLabel += `\n(${this.unPushedCommits} unpushed commits)`;
             }
         } else {
-            this.statusBarEl.ariaLabel = this.plugin.offlineMode
+            this.statusBarEl.ariaLabel = offlineMode
                 ? "Git is offline"
                 : "Git is ready";
         }
 
-        if (this.plugin.offlineMode) {
+        if (offlineMode) {
             setIcon(this.iconEl, "globe");
         } else {
             setIcon(this.iconEl, "check");
@@ -141,6 +291,8 @@ export class StatusBar {
             this.textEl.setText(
                 this.plugin.cachedStatus.changed.length.toString()
             );
+        } else {
+            this.textEl.empty();
         }
         this.statusBarEl.addClass(this.base + "idle");
     }
@@ -148,7 +300,10 @@ export class StatusBar {
     private async refreshCommitTimestamp() {
         this.lastCommitTimestamp =
             await this.plugin.gitManager.getLastCommitTime();
-        this.unPushedCommits =
-            await this.plugin.gitManager.getUnpushedCommits();
+        this.unPushedCommits = await this.plugin.getUnpushedCommits();
+    }
+
+    public remove() {
+        this.statusBarEl.remove();
     }
 }

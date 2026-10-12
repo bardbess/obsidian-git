@@ -1,91 +1,118 @@
 <!-- tslint:disable ts(2345)  -->
 <script lang="ts">
-    import ObsidianGit from "src/main";
-    import { FileType, StatusRootTreeItem, TreeItem } from "src/types";
-    import { DiscardModal } from "src/ui/modals/discardModal";
+    import TreeComponent from "./treeComponent.svelte";
+
+    import type ObsidianGit from "src/main";
+    import type { StatusRootTreeItem, TreeItem } from "src/types";
+    import { FileType } from "src/types";
     import { slide } from "svelte/transition";
-    import GitView from "../sourceControl";
+    import type GitView from "../sourceControl";
     import FileComponent from "./fileComponent.svelte";
+    import ConflictFileComponent from "./conflictFileComponent.svelte";
     import PulledFileComponent from "./pulledFileComponent.svelte";
     import StagedFileComponent from "./stagedFileComponent.svelte";
-    export let hierarchy: StatusRootTreeItem;
-    export let plugin: ObsidianGit;
-    export let view: GitView;
-    export let fileType: FileType;
-    export let topLevel = false;
-    const closed: Record<string, boolean> = {};
-    $: side = (view.leaf.getRoot() as any).side == "left" ? "right" : "left";
+    import {
+        arrayProxyWithNewLength,
+        getTooltipSide,
+        mayTriggerFileMenu,
+    } from "src/utils";
+    import TooManyFilesComponent from "./tooManyFilesComponent.svelte";
+    import { onMount } from "svelte";
+    interface Props {
+        hierarchy: StatusRootTreeItem;
+        plugin: ObsidianGit;
+        view: GitView;
+        fileType: FileType;
+        topLevel?: boolean;
+        closed: Record<string, boolean>;
+        conflictCounts?: Record<string, number>;
+    }
 
-    function stage(path: string) {
-        plugin.gitManager.stageAll({ dir: path }).finally(() => {
-            dispatchEvent(new CustomEvent("git-refresh"));
-        });
+    let {
+        hierarchy,
+        plugin,
+        view,
+        fileType,
+        topLevel = false,
+        closed = $bindable(),
+        conflictCounts = {},
+    }: Props = $props();
+
+    onMount(() => {
+        for (const entity of hierarchy.children) {
+            if ((entity.children?.length ?? 0) > 100)
+                closed[entity.path] = true;
+        }
+    });
+    let side = $derived(getTooltipSide(view.leaf));
+
+    function stage(event: MouseEvent, path: string) {
+        event.stopPropagation();
+        plugin.promiseQueue.addTask(() => plugin.gitActions.stageAll(path));
     }
-    function unstage(path: string) {
-        plugin.gitManager.unstageAll({ dir: path }).finally(() => {
-            dispatchEvent(new CustomEvent("git-refresh"));
-        });
+    function unstage(event: MouseEvent, path: string) {
+        event.stopPropagation();
+        plugin.promiseQueue.addTask(() => plugin.gitActions.unstageAll(path));
     }
-    function discard(item: TreeItem) {
-        new DiscardModal(view.app, false, item.vaultPath)
-            .myOpen()
-            .then((shouldDiscard) => {
-                if (shouldDiscard === true) {
-                    plugin.gitManager
-                        .discardAll({
-                            dir: item.path,
-                            status: plugin.cachedStatus,
-                        })
-                        .finally(() => {
-                            dispatchEvent(new CustomEvent("git-refresh"));
-                        });
-                }
-            });
+    function discard(event: MouseEvent, item: TreeItem) {
+        event.stopPropagation();
+        plugin.promiseQueue.addTask(() =>
+            plugin.gitActions.discardAll(item.vaultPath)
+        );
     }
-    function fold(item: TreeItem) {
-        closed[item.title] = !closed[item.title];
+    function fold(event: MouseEvent, item: TreeItem) {
+        event.stopPropagation();
+        closed[item.path] = !closed[item.path];
     }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <main class:topLevel>
-    {#each hierarchy.children as entity}
+    {#each arrayProxyWithNewLength(hierarchy.children, 500) as entity}
         {#if entity.data}
             <div>
                 {#if fileType == FileType.staged}
-                    <StagedFileComponent
-                        change={entity.data}
-                        manager={plugin.gitManager}
-                        {view}
-                    />
+                    <StagedFileComponent change={entity.data} {view} />
                 {:else if fileType == FileType.changed}
-                    <FileComponent
-                        change={entity.data}
-                        manager={plugin.gitManager}
-                        {view}
-                    />
+                    <FileComponent change={entity.data} {view} />
                 {:else if fileType == FileType.pulled}
                     <PulledFileComponent change={entity.data} {view} />
+                {:else if fileType == FileType.conflicted}
+                    <ConflictFileComponent
+                        path={entity.data.path}
+                        count={conflictCounts[entity.data.path]}
+                        manager={plugin.gitManager}
+                        {view}
+                    />
                 {/if}
             </div>
         {:else}
             <div
-                on:click={() => fold(entity)}
+                onauxclick={(event) =>
+                    mayTriggerFileMenu(
+                        view.app,
+                        event,
+                        entity.vaultPath,
+                        view.leaf,
+                        "git-source-control"
+                    )}
                 class="tree-item nav-folder"
-                class:is-collapsed={closed[entity.title]}
+                class:is-collapsed={closed[entity.path]}
             >
                 <div
                     class="tree-item-self is-clickable nav-folder-title"
-                    aria-label-position={side}
                     data-tooltip-position={side}
                     aria-label={entity.vaultPath}
+                    onclick={(event) => fold(event, entity)}
                 >
                     <div
                         data-icon="folder"
                         style="padding-right: 5px; display: flex; "
-                    />
+                    ></div>
                     <div
                         class="tree-item-icon nav-folder-collapse-indicator collapse-icon"
-                        class:is-collapsed={closed[entity.title]}
+                        class:is-collapsed={closed[entity.path]}
                     >
                         <svg
                             xmlns="http://www.w3.org/2000/svg"
@@ -110,8 +137,8 @@
                                 <div
                                     data-icon="minus"
                                     aria-label="Unstage"
-                                    on:click|stopPropagation={() =>
-                                        unstage(entity.path)}
+                                    onclick={(event) =>
+                                        unstage(event, entity.path)}
                                     class="clickable-icon"
                                 >
                                     <svg
@@ -132,12 +159,11 @@
                                         /></svg
                                     >
                                 </div>
-                            {:else}
+                            {:else if fileType == FileType.changed}
                                 <div
                                     data-icon="undo"
                                     aria-label="Discard"
-                                    on:click|stopPropagation={() =>
-                                        discard(entity)}
+                                    onclick={(event) => discard(event, entity)}
                                     class="clickable-icon"
                                 >
                                     <svg
@@ -159,8 +185,8 @@
                                 <div
                                     data-icon="plus"
                                     aria-label="Stage"
-                                    on:click|stopPropagation={() =>
-                                        stage(entity.path)}
+                                    onclick={(event) =>
+                                        stage(event, entity.path)}
                                     class="clickable-icon"
                                 >
                                     <svg
@@ -187,33 +213,29 @@
                                     >
                                 </div>
                             {/if}
-                            <div style="width:11px" />
+                            <div style="width:11px"></div>
                         </div>
                     </div>
                 </div>
 
-                {#if !closed[entity.title]}
+                {#if !closed[entity.path]}
                     <div
                         class="tree-item-children nav-folder-children"
                         transition:slide|local={{ duration: 150 }}
                     >
-                        <svelte:self
-                            hierarchy={entity}
+                        <TreeComponent
+                            hierarchy={entity as StatusRootTreeItem}
                             {plugin}
                             {view}
                             {fileType}
+                            {conflictCounts}
+                            bind:closed
                         />
                     </div>
                 {/if}
             </div>
         {/if}
     {/each}
-</main>
 
-<style lang="scss">
-    main {
-        .nav-folder-title {
-            align-items: center;
-        }
-    }
-</style>
+    <TooManyFilesComponent files={hierarchy.children} />
+</main>

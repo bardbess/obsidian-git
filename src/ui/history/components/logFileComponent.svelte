@@ -1,71 +1,117 @@
 <script lang="ts">
     import { setIcon, TFile } from "obsidian";
-    import { DIFF_VIEW_CONFIG } from "src/constants";
-    import { DiffFile } from "src/types";
-    import { getDisplayPath, getNewLeaf } from "src/utils";
-    import HistoryView from "../historyView";
+    import type { DiffFile } from "src/types";
+    import {
+        fileIsBinary,
+        fileOpenableInObsidian,
+        getDisplayPath,
+        getNewLeaf,
+        getTooltipSide,
+        mayTriggerFileMenu,
+    } from "src/utils";
+    import type HistoryView from "../historyView";
 
-    export let diff: DiffFile;
-    export let view: HistoryView;
-    let buttons: HTMLElement[] = [];
+    interface Props {
+        diff: DiffFile;
+        view: HistoryView;
+    }
 
-    $: side = (view.leaf.getRoot() as any).side == "left" ? "right" : "left";
+    let { diff, view }: Props = $props();
+    let buttons: HTMLElement[] = $state([]);
 
-    window.setTimeout(
-        () => buttons.forEach((b) => setIcon(b, b.getAttr("data-icon")!)),
-        0
-    );
+    let side = $derived(getTooltipSide(view.leaf));
+
+    $effect(() => {
+        for (const b of buttons) if (b) setIcon(b, b.getAttr("data-icon")!);
+    });
+
+    function mainClick(event: MouseEvent) {
+        event.stopPropagation();
+        if (fileIsBinary(diff.path)) {
+            open(event);
+        } else {
+            showDiff(event);
+        }
+    }
 
     function open(event: MouseEvent) {
-        const file = view.app.vault.getAbstractFileByPath(diff.vault_path);
+        event.stopPropagation();
+        const file = view.app.vault.getAbstractFileByPath(diff.vaultPath);
 
         if (file instanceof TFile) {
-            getNewLeaf(event)?.openFile(file);
+            getNewLeaf(view.app, event)
+                ?.openFile(file)
+                .catch((e) => view.plugin.displayError(e));
         }
     }
 
     function showDiff(event: MouseEvent) {
-        getNewLeaf(event)?.setViewState({
-            type: DIFF_VIEW_CONFIG.type,
-            active: true,
-            state: {
-                file: diff.path,
-                staged: false,
-                hash: diff.hash,
-            },
+        view.plugin.tools.openDiff({
+            event,
+            aFile: diff.fromPath ?? diff.path,
+            aRef: `${diff.hash}^`,
+            bFile: diff.path,
+            bRef: diff.hash,
         });
+    }
+
+    function openAtCommit(event: MouseEvent) {
+        event.stopPropagation();
+        view.plugin.tools
+            .openFileAtCommit(diff.path, diff.hash)
+            .catch((e) => view.plugin.displayError(e));
     }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <main
-    on:click|stopPropagation={showDiff}
-    on:auxclick|stopPropagation={showDiff}
-    on:focus
+    onclick={mainClick}
+    onauxclick={(event) => {
+        event.stopPropagation();
+        if (event.button == 2)
+            mayTriggerFileMenu(
+                view.app,
+                event,
+                diff.vaultPath,
+                view.leaf,
+                "git-history"
+            );
+        else mainClick(event);
+    }}
     class="tree-item nav-file"
 >
     <div
         class="tree-item-self is-clickable nav-file-title"
-        class:is-active={view.plugin.lastDiffViewState?.file ==
-            diff.vault_path && view.plugin.lastDiffViewState?.hash}
-        data-path={diff.vault_path}
-        aria-label-position={side}
+        data-path={diff.vaultPath}
         data-tooltip-position={side}
-        aria-label={diff.vault_path}
+        aria-label={diff.vaultPath}
     >
         <div class="tree-item-inner nav-file-title-content">
-            {getDisplayPath(diff.vault_path)}
+            {getDisplayPath(diff.vaultPath)}
         </div>
         <div class="git-tools">
             <div class="buttons">
-                {#if view.app.vault.getAbstractFileByPath(diff.vault_path)}
+                {#if diff.status !== "D" && !diff.binary && !fileIsBinary(diff.path)}
+                    <div
+                        data-icon="file-clock"
+                        aria-label="Open file at this commit"
+                        bind:this={buttons[1]}
+                        onauxclick={openAtCommit}
+                        onclick={openAtCommit}
+                        class="clickable-icon"
+                    ></div>
+                {/if}
+                {#if fileOpenableInObsidian(diff.vaultPath, view.app)}
                     <div
                         data-icon="go-to-file"
                         aria-label="Open File"
                         bind:this={buttons[0]}
-                        on:auxclick|stopPropagation={open}
-                        on:click|stopPropagation={open}
+                        onauxclick={open}
+                        onclick={open}
                         class="clickable-icon"
-                    />
+                    ></div>
                 {/if}
             </div>
             <span class="type" data-type={diff.status}>{diff.status}</span>

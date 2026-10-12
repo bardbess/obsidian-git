@@ -1,16 +1,21 @@
-import { App, Modal } from "obsidian";
+import type { App } from "obsidian";
+import { Modal } from "obsidian";
 
 export class IgnoreModal extends Modal {
     resolve:
-        | ((value: string | PromiseLike<string> | undefined) => void)
-        | null = null;
-    constructor(app: App, private content: string) {
+        ((value: string | PromiseLike<string> | undefined) => void) | null =
+        null;
+    constructor(
+        app: App,
+        private content: string
+    ) {
         super(app);
     }
-    open(): Promise<string> {
-        super.open();
+
+    openAndGetReslt(): Promise<string | undefined> {
         return new Promise((resolve) => {
             this.resolve = resolve;
+            this.open();
         });
     }
 
@@ -28,18 +33,15 @@ export class IgnoreModal extends Modal {
         div.createEl("button", {
             cls: ["mod-cta", "obsidian-git-center-button"],
             text: "Save",
-        }).addEventListener("click", async () => {
-            // `this.resolve` asserts non-null here because the function is assigned when the `this.open()` is called
-            // and is not null at the time the save button is clicked.
+        }).addEventListener("click", () => {
             this.resolve!(text.value);
             this.close();
         });
     }
+
     onClose() {
         const { contentEl } = this;
-        // `this.resolve` asserts non-null here because the function is assigned when the `this.open()` is called
-        // and is not null at the time the modal is closed.
-        this.resolve!(undefined);
         contentEl.empty();
+        if (this.resolve) this.resolve(undefined);
     }
 }

@@ -1,14 +1,13 @@
-import { HoverParent, HoverPopover, ItemView, WorkspaceLeaf } from "obsidian";
+import type { HoverParent, HoverPopover, WorkspaceLeaf } from "obsidian";
+import { ItemView } from "obsidian";
 import { HISTORY_VIEW_CONFIG } from "src/constants";
-import ObsidianGit from "src/main";
-// @tsconfig/svelte is required to resolve this error.
-// Ignore temporarily.
-// @ts-ignore
+import type ObsidianGit from "src/main";
 import HistoryViewComponent from "./historyView.svelte";
+import { mount, unmount } from "svelte";
 
 export default class HistoryView extends ItemView implements HoverParent {
     plugin: ObsidianGit;
-    private _view: HistoryViewComponent;
+    private _view: Record<string, unknown> | undefined;
     hoverPopover: HoverPopover | null;
 
     constructor(leaf: WorkspaceLeaf, plugin: ObsidianGit) {
@@ -29,18 +28,28 @@ export default class HistoryView extends ItemView implements HoverParent {
         return HISTORY_VIEW_CONFIG.icon;
     }
 
-    onClose(): Promise<void> {
+    async onClose(): Promise<void> {
+        if (this._view) {
+            await unmount(this._view);
+        }
         return super.onClose();
     }
 
-    onOpen(): Promise<void> {
-        this._view = new HistoryViewComponent({
+    async reload(): Promise<void> {
+        if (this._view) {
+            await unmount(this._view);
+        }
+        this._view = mount(HistoryViewComponent, {
             target: this.contentEl,
             props: {
                 plugin: this.plugin,
                 view: this,
             },
         });
+    }
+
+    async onOpen(): Promise<void> {
+        await this.reload();
         return super.onOpen();
     }
 }

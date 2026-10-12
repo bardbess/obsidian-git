@@ -3,11 +3,22 @@ on:
     push:
     pull_request:
 jobs:
+    svelte-check:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+            - name: Install modules
+              run: pnpm install
+            - name: Run Svelte-Check
+              run: pnpm run svelte
     lint:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v2
-            - uses: pnpm/action-setup@v2
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
               with:
                   version: latest
             - name: Install modules
@@ -17,8 +28,8 @@ jobs:
     format:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v2
-            - uses: pnpm/action-setup@v2
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
               with:
                   version: latest
             - name: Install modules
@@ -28,22 +39,33 @@ jobs:
     compile:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v2
-            - uses: pnpm/action-setup@v2
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
               with:
                   version: latest
             - name: Install modules
               run: pnpm install
             - name: Run tsc
-              run: tsc --noEmit
+              run: pnpm run tsc --noEmit
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+            - name: Install modules
+              run: pnpm install
+            - name: Run build
+              run: pnpm run test
     build:
         runs-on: ubuntu-latest
         steps:
-            -   uses: actions/checkout@v2
-            -   uses: pnpm/action-setup@v2
-                with:
-                    version: latest
-            -   name: Install modules
-                run: pnpm install
-            -   name: Run build
-                run: pnpm run build
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+            - name: Install modules
+              run: pnpm install
+            - name: Run build
+              run: pnpm run build
