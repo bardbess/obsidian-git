@@ -62,13 +62,33 @@ export class IsomorphicGit extends GitManager {
     };
     private readonly noticeLength = 999_999;
     private readonly fs = new MyAdapter(this.app.vault, this.plugin);
+    // isomorphic-git keeps parsed pack indexes, whole packfiles and the parsed
+    // index in its cache object. Without a shared one, every call re-reads
+    // and re-hashes each packfile it touches. Share it within an action, and
+    // drop it afterwards so packfiles don't stay in memory between actions.
+    private actionCache: object | undefined;
+    private actionScopes = 0;
 
     constructor(plugin: ObsidianGit) {
         super(plugin);
     }
 
+    override async withActionScope<T>(fn: () => Promise<T>): Promise<T> {
+        if (this.actionScopes++ === 0) {
+            this.actionCache = {};
+        }
+        try {
+            return await fn();
+        } finally {
+            if (--this.actionScopes === 0) {
+                this.actionCache = undefined;
+            }
+        }
+    }
+
     getRepo(): {
         fs: MyAdapter;
+        cache: object;
         dir: string;
         gitdir?: string;
         onAuth: AuthCallback;
@@ -77,6 +97,7 @@ export class IsomorphicGit extends GitManager {
     } {
         return {
             fs: this.fs,
+            cache: this.actionCache ?? {},
             dir: this.plugin.settings.basePath || "/",
             gitdir: this.plugin.settings.gitDir
                 ? this.getGitDirPath()
@@ -170,6 +191,11 @@ export class IsomorphicGit extends GitManager {
             await this.fs.saveAndClear();
             return res;
         } catch (error) {
+            // A failed call can leave a half-updated index in the cache, which
+            // later calls would trust because the file on disk is unchanged.
+            if (this.actionCache !== undefined) {
+                this.actionCache = {};
+            }
             await this.fs.saveAndClear();
             throw error;
         }
@@ -814,6 +840,11 @@ export class IsomorphicGit extends GitManager {
     }
 
     async fetch(remote?: string): Promise<void> {
+        // The download buffers the whole response in memory, so don't keep
+        // packfiles loaded by earlier calls alive alongside it.
+        if (this.actionCache !== undefined) {
+            this.actionCache = {};
+        }
         const progressNotice = this.showNotice("Initializing fetch");
 
         try {

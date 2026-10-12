@@ -6,6 +6,15 @@ export class PromiseQueue {
     private currentTask: Promise<unknown> | null = null;
 
     /**
+     * @param runTask Runs each task, e.g. to wrap it in a shared scope.
+     */
+    constructor(
+        private readonly runTask: <T>(task: () => Promise<T>) => Promise<T> = (
+            task
+        ) => task()
+    ) {}
+
+    /**
      * Add a task to the queue.
      *
      * @param task The task to add.
@@ -35,7 +44,7 @@ export class PromiseQueue {
         }
         const item = this.tasks.shift()!;
         this.currentTask = Promise.resolve()
-            .then(() => item.task())
+            .then(() => this.runTask(item.task))
             .then(
                 (res) => {
                     try {

@@ -75,7 +75,11 @@ export default class ObsidianGit extends Plugin {
      * This is used to show a notice in the source control view
      */
     repositoryMissing = false;
-    promiseQueue: PromiseQueue = new PromiseQueue();
+    // Each queued task is one action, so the Git backend can share its caches
+    // across the calls the task makes.
+    promiseQueue: PromiseQueue = new PromiseQueue((task) =>
+        this.gitManager ? this.gitManager.withActionScope(task) : task()
+    );
 
     /**
      * Debouncer for the auto commit after file changes.

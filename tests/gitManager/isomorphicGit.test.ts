@@ -227,3 +227,68 @@ describe("IsomorphicGit.status", () => {
         expect(workTreeReads()).toBe(0);
     });
 });
+
+describe("IsomorphicGit action cache", () => {
+    async function createPackedRepoManager() {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.appendAndCommit("note.md", "more\n", "second");
+        await repo.raw(["gc", "--quiet"]);
+        const context = createIsomorphicGitManager(repo.repoPath);
+        const readBinary = vi.spyOn(
+            context.plugin.app.vault.adapter,
+            "readBinary"
+        );
+        const packReads = () =>
+            readBinary.mock.calls.filter(([vaultPath]) =>
+                vaultPath.endsWith(".pack")
+            ).length;
+        return { ...context, packReads };
+    }
+
+    it("reads each packfile once per action", async () => {
+        const { manager, packReads } = await createPackedRepoManager();
+
+        await manager.withActionScope(async () => {
+            await manager.getLastCommitTime();
+            await manager.getLastCommitTime();
+        });
+
+        expect(packReads()).toBe(1);
+    });
+
+    it("does not keep packfiles between actions", async () => {
+        const { manager, packReads } = await createPackedRepoManager();
+
+        await manager.withActionScope(() => manager.getLastCommitTime());
+        await manager.withActionScope(() => manager.getLastCommitTime());
+
+        expect(packReads()).toBe(2);
+    });
+
+    it("does not hold packfiles during a fetch", async () => {
+        const { manager, packReads } = await createPackedRepoManager();
+        vi.spyOn(git, "fetch").mockResolvedValue(
+            {} as Awaited<ReturnType<typeof git.fetch>>
+        );
+
+        await manager.withActionScope(async () => {
+            await manager.getLastCommitTime();
+            await manager.fetch("origin");
+            await manager.getLastCommitTime();
+        });
+
+        expect(packReads()).toBe(2);
+    });
+
+    it("starts a fresh cache after a failed call", async () => {
+        const { manager, packReads } = await createPackedRepoManager();
+
+        await manager.withActionScope(async () => {
+            await manager.getLastCommitTime();
+            await expect(manager.checkout("missing")).rejects.toThrow();
+            await manager.getLastCommitTime();
+        });
+
+        expect(packReads()).toBe(2);
+    });
+});

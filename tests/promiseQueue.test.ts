@@ -23,3 +23,19 @@ describe("PromiseQueue", () => {
         expect(nextTask).toHaveBeenCalledOnce();
     });
 });
+
+describe("PromiseQueue runTask", () => {
+    it("runs each task through the given runner", async () => {
+        let runs = 0;
+        const result = await new Promise<string | undefined>((resolve) => {
+            const queue = new PromiseQueue((task) => {
+                runs++;
+                return task();
+            });
+            queue.addTask(() => Promise.resolve("done"), resolve);
+        });
+
+        expect(result).toBe("done");
+        expect(runs).toBe(1);
+    });
+});

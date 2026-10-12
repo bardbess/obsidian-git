@@ -22,13 +22,21 @@ export abstract class GitManager {
         this.app = plugin.app;
     }
 
+    /**
+     * Runs `fn` as one user-level action. Backends may reuse state across the
+     * Git calls made inside it.
+     */
+    withActionScope<T>(fn: () => Promise<T>): Promise<T> {
+        return fn();
+    }
+
     protected async withGitOperation<T>(
         operation: GitOperation,
         fn: () => Promise<T>
     ): Promise<T> {
         this.plugin.setPluginState({ operation });
         try {
-            return await fn();
+            return await this.withActionScope(fn);
         } finally {
             this.plugin.statusBar?.clearProgress(false);
             this.plugin.setPluginState({ operation: GitOperation.idle });
